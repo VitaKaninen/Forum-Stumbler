@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.7.0
+// @version     0.8.0
 // @author      VitaKaninen
-// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site with subforum scoping and teachable, structure-based link detection.
+// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site with subforum scoping, guided click-to-teach, numeric-pagination detection, and live re-scan for lazy-loaded lists.
 // @match       *://*/*
 // @grant       GM_setValue
 // @grant       GM_getValue
@@ -26,7 +26,7 @@
     const TOUR_KEY = 'fs_tour';           // sessionStorage: { urls, titles, source, sourceTitle, nextPage, ts }
     const RESUME_KEY = 'fs_resume';       // sessionStorage: '' | 'append' — set when we navigate to a next page as a fallback
     const POS_KEY = 'fs_barpos';          // GM: { right, bottom }
-    const SITES_KEY = 'fs_sites';         // GM: { "<host>": { all, prefixes[], pattern, sig } }
+    const SITES_KEY = 'fs_sites';         // GM: { "<host>": { all, prefixes[], pattern, sig, nextSig } }
     const AUTO_CHAIN = true;              // pull the forum's "next page" of results at end of a tour
     const MIN_CLUSTER = 4;                // heuristic: need at least this many links to call it a topic list
     const MIN_TAUGHT = 2;                 // taught signature/pattern: trust smaller lists
@@ -50,6 +50,12 @@
     // Hrefs that are clearly NOT topics (nav/pagination/account/etc). Heuristic only —
     // taught detection overrides this list.
     const NEGATIVE = /(\/login|\/logout|\/register|\/signup|\/sign-in|\/profile|\/members?\/|\/users?\/|\/tag[s]?\/|\/categor|\/forum[s]?\/?$|[?&]page=|\/page\/\d|[?&]start=\d|\/search|\/rss|\/feed|\.(png|jpe?g|gif|svg|css|js|pdf|zip)(\?|$))/i;
+
+    // Forward-pagination vocabulary — deliberately narrow (this is not the "don't open
+    // in a new tab" list from Open-Links-in-New-Tab; things like best/hot/top/reply/
+    // "read more" are not list pagination and must not send the tour off-track).
+    // "previous"/"newer"/back-arrows are excluded so we never walk backwards.
+    const NEXT_TEXT = /^(next|next\s*page|older|older\s*posts?|more|load\s*more|show\s*more|next\s*[»›→]|»|›|→|>>)$/i;
 
     // ---------------- Utilities ----------------
     // Normalise a URL for comparison/storage: absolute, no hash, no trailing slash.
@@ -117,7 +123,8 @@
                     all: ('all' in cfg) ? !!cfg.all : true, // pre-0.7 entries were site-wide
                     prefixes: Array.isArray(cfg.prefixes) ? cfg.prefixes.filter(p => typeof p === 'string' && p) : [],
                     pattern: typeof cfg.pattern === 'string' ? cfg.pattern : null,
-                    sig: typeof cfg.sig === 'string' ? cfg.sig : null
+                    sig: typeof cfg.sig === 'string' ? cfg.sig : null,
+                    nextSig: typeof cfg.nextSig === 'string' ? cfg.nextSig : null
                 };
             }
             return out;
@@ -180,9 +187,27 @@
     // Works on either the live document or a fetched-and-parsed one; `base` is that
     // document's own URL so relative hrefs resolve correctly.
 
-    // Shared anchor filter: same-site, not the current page, not pagination, has a
-    // title-ish text. `applyNegative` is skipped for taught detection (the taught
-    // structure/pattern is the authority there).
+    // Every same-site, non-current anchor (no filtering) — used by next-page detection.
+    function allAnchors(root, base) {
+        let origin;
+        try { origin = new URL(base).origin; } catch (_) { return []; }
+        const here = norm(base, base);
+        const out = [];
+        for (const a of root.querySelectorAll('a[href]')) {
+            const raw = a.getAttribute('href');
+            if (!raw || raw.startsWith('#') || /^(javascript|mailto|tel):/i.test(raw)) continue;
+            let u;
+            try { u = new URL(raw, base); } catch (_) { continue; }
+            if (u.origin !== origin) continue;
+            const nurl = norm(u.href, base);
+            if (nurl === here) continue;
+            out.push({ a, url: nurl, urlObj: u, text: (a.textContent || '').trim() });
+        }
+        return out;
+    }
+
+    // Filtered anchors for topic detection: same-site, not current, not chrome/pagination,
+    // has title-ish text. `applyNegative` is skipped for taught detection.
     function collectAnchors(root, base, applyNegative) {
         let baseOrigin;
         try { baseOrigin = new URL(base).origin; } catch (_) { return null; }
@@ -207,6 +232,18 @@
         return records;
     }
 
+    // All same-signature topic anchors on the page, deduped by URL (wordiest text wins).
+    function clusterForSig(sig) {
+        const recs = collectAnchors(document, location.href, false) || [];
+        const byUrl = new Map();
+        for (const r of recs) {
+            if (signature(r.a, true) !== sig) continue;
+            const prev = byUrl.get(r.url);
+            if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
+        }
+        return Array.from(byUrl.values());
+    }
+
     // Taught URL pattern (secondary): match pathname+search against the stored regex.
     // Used when the taught structure isn't found (e.g. raw fetched HTML that differs
     // from the live DOM, or a theme change).
@@ -221,7 +258,7 @@
             if (!rx.test(r.urlObj.pathname + r.urlObj.search)) continue;
             const prev = byUrl.get(r.url);
             if (!prev) byUrl.set(r.url, { url: r.url, text: r.text });
-            else if (r.text.length > prev.text.length) prev.text = r.text; // keep the wordiest (title beats "5 replies")
+            else if (r.text.length > prev.text.length) prev.text = r.text; // keep the wordiest
         }
         const list = Array.from(byUrl.values());
         return list.length ? list : null;
@@ -289,45 +326,65 @@
         return detectTopics(root, base);
     }
 
-    function detectNextPage(root, base) {
+    // Given a set of anchors, find the "next page" among numeric page-number links.
+    // The current page is the smallest page number NOT linked (it's rendered as plain
+    // text/active), so next = that number + 1. Naturally yields nothing on the last
+    // page. Works regardless of URL shape, including offset schemes where page 1 omits
+    // the offset (…vf13.htm) and page 2 adds it (…vf13,25.htm).
+    function pickNumericNext(anchors) {
+        const byNum = new Map();
+        for (const r of anchors) {
+            if (!/^\d{1,6}$/.test(r.text)) continue;
+            const n = parseInt(r.text, 10);
+            if (!n || byNum.has(n)) continue;
+            byNum.set(n, r.url);
+        }
+        if (!byNum.size) return null;
+        let current = 1;
+        while (byNum.has(current)) current++;
+        return byNum.get(current + 1) || null;
+    }
+
+    function pickTextNext(anchors) {
+        for (const r of anchors) {
+            const al = (r.a.getAttribute('aria-label') || '').trim();
+            if (NEXT_TEXT.test(r.text) || (/next|older/i.test(al) && !/prev|newer/i.test(al))) return r.url;
+        }
+        return null;
+    }
+
+    // Next-page order: taught pager signature → rel=next → numeric page links →
+    // narrowed forward-text/arrow. Always returns a same-site normalized URL or null.
+    function detectNextPage(root, base, cfg) {
         base = base || location.href;
-        let baseOrigin;
-        try { baseOrigin = new URL(base).origin; } catch (_) { baseOrigin = location.origin; }
-        // rel=next first (same-site only, like everything else we fetch)
-        let el = root.querySelector('a[rel~="next"], link[rel~="next"]');
+        const anchors = allAnchors(root, base);
+
+        if (cfg && cfg.nextSig) {
+            const grp = anchors.filter(r => signature(r.a, true) === cfg.nextSig);
+            const r = pickNumericNext(grp) || pickTextNext(grp) || (grp.length === 1 ? grp[0].url : null);
+            if (r) return r;
+        }
+
+        let origin;
+        try { origin = new URL(base).origin; } catch (_) { origin = location.origin; }
+        const el = root.querySelector('a[rel~="next"], link[rel~="next"]');
         if (el) {
             const raw = el.getAttribute('href');
             if (raw) {
                 try {
                     const u = new URL(raw, base);
-                    if (u.origin === baseOrigin) return norm(u.href, base);
+                    if (u.origin === origin) return norm(u.href, base);
                 } catch (_) {}
             }
         }
-        // then anchors whose text/aria look like "next" — no chrome exclusion here,
-        // pagination legitimately lives inside <nav> on many forums
-        const rx = /^(next|older|more|›|»|>>|→|next\s*page|next\s*»?)$/i;
-        for (const a of root.querySelectorAll('a[href]')) {
-            const t = (a.textContent || '').trim();
-            const al = (a.getAttribute('aria-label') || '').trim();
-            if (rx.test(t) || /next|older/i.test(al)) {
-                const raw = a.getAttribute('href');
-                if (!raw || raw.startsWith('#')) continue;
-                try {
-                    const u = new URL(raw, base);
-                    if (u.origin === baseOrigin) return norm(u.href, base);
-                } catch (_) {}
-            }
-        }
-        return null;
+
+        return pickNumericNext(anchors) || pickTextNext(anchors);
     }
 
-    // ---------------- Teaching ----------------
-    // Structure-first: from one example topic link pasted by the user, find that
-    // anchor on the page, take its structural signature, and treat every anchor
-    // sharing that structure as the topic list. A URL pattern is additionally derived
-    // from that structural cluster as a fallback for fetched pages / theme changes.
-    // The example link itself is never stored.
+    // ---------------- Teaching: pattern derivation ----------------
+    // Structure-first: learn from the anchor the user clicks (or pastes). A URL pattern
+    // is additionally derived from the structural cluster as a fallback for fetched
+    // pages / theme changes. The example link itself is never stored.
     const escRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pathSegs = (p) => p.replace(/\/+$/, '').split('/').filter(Boolean);
 
@@ -337,7 +394,7 @@
     // e.g. ["niski-przelot-vt623031.htm", "chodnikiem-vt623002.htm"] → "[^/]*-vt\d+\.htm"
     function generalizeVals(vals) {
         if (vals.every(v => /^\d+$/.test(v))) return '\\d+';
-        const t = vals.map(v => v.replace(/\d+/g, ' '));
+        const t = vals.map(v => v.replace(/\d+/g, ' '));
         let pre = t[0];
         for (const s of t) {
             let i = 0;
@@ -353,7 +410,7 @@
         const minLen = Math.min.apply(null, t.map(s => s.length));
         if (pre.length + suf.length > minLen) suf = suf.slice(pre.length + suf.length - minLen);
         const mid = t.every(s => s.length === pre.length + suf.length) ? '' : '[^/]*';
-        const conv = (s) => s.split(' ').map(escRx).join('\\d+');
+        const conv = (s) => s.split(' ').map(escRx).join('\\d+');
         return conv(pre) + mid + conv(suf);
     }
 
@@ -372,6 +429,7 @@
         return src;
     }
 
+    // Paste-fallback analysis: locate the pasted link on the page, learn its structure.
     function analyzeExample(exampleRaw) {
         let exUrl;
         try { exUrl = new URL(norm((exampleRaw || '').trim())); } catch (_) {
@@ -393,26 +451,130 @@
                     : 'That link is not on this page — open the index page that lists it, then teach.'
             };
         }
-        // The same topic often has several anchors (title, last-post); the wordiest one
-        // is the title link.
         const example = matches.reduce((p, c) => (c.text.length >= p.text.length ? c : p));
         const sig = signature(example.a, true);
-
-        // Structural cluster: every anchor on the page built the same way.
-        const byUrl = new Map();
-        for (const r of records) {
-            if (signature(r.a, true) !== sig) continue;
-            const prev = byUrl.get(r.url);
-            if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
-        }
-        const cluster = Array.from(byUrl.values());
-        const count = cluster.length;
-        const pattern = count >= 3 ? deriveFromUrls(cluster.map(r => r.urlObj)) : null;
-        return { sig, pattern, count };
+        const cluster = clusterForSig(sig);
+        const pattern = cluster.length >= 3 ? deriveFromUrls(cluster.map(r => r.urlObj)) : null;
+        return { sig, pattern, count: cluster.length };
     }
+
+    // ---------------- Teaching: guided click-to-pick ----------------
+    let captureState = null;   // { domain, step: 'topic' | 'next' }
+    let captureBanner = null;
+    let hoverEl = null;
+
+    function showCaptureBanner() {
+        captureBanner = document.createElement('div');
+        captureBanner.id = 'fs-teach-banner';
+        captureBanner.style.cssText = 'all: initial;';
+        const root = captureBanner.attachShadow({ mode: 'open' });
+        const st = document.createElement('style');
+        st.textContent = ':host { all: initial; } * { box-sizing: border-box; }';
+        root.appendChild(st);
+        const wrap = document.createElement('div');
+        wrap.style.cssText = `
+            position: fixed; top: 0; left: 0; right: 0; z-index: 2147483647;
+            display: flex; align-items: center; justify-content: center; gap: 14px;
+            padding: 11px 16px; background: #1e1e2e; color: #cdd6f4;
+            font: 14px/1.35 system-ui, sans-serif; box-shadow: 0 2px 14px rgba(0,0,0,0.45);
+        `;
+        const msg = document.createElement('span');
+        msg.style.cssText = 'font-weight: 600; text-align: center;';
+        const cancel = document.createElement('button');
+        cancel.textContent = 'Cancel';
+        cancel.style.cssText = 'padding: 5px 14px; border: none; border-radius: 6px; background: #45475a; color: #cdd6f4; font-weight: 700; font-size: 13px; cursor: pointer; flex-shrink: 0;';
+        cancel.addEventListener('click', exitCapture);
+        wrap.append(msg, cancel);
+        root.appendChild(wrap);
+        document.documentElement.appendChild(captureBanner);
+        captureBanner._msg = msg;
+    }
+    function setBanner(text, color) {
+        if (captureBanner && captureBanner._msg) {
+            captureBanner._msg.textContent = text;
+            captureBanner._msg.style.color = color || '#cdd6f4';
+        }
+    }
+
+    function onCaptureMove(e) {
+        const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+        if (hoverEl && hoverEl !== a) { hoverEl.style.outline = hoverEl._fsOldOutline || ''; hoverEl = null; }
+        if (a && a !== hoverEl) {
+            hoverEl = a;
+            a._fsOldOutline = a.style.outline;
+            a.style.outline = '2px solid #89b4fa';
+            a.style.outlineOffset = '1px';
+        }
+    }
+    function onCaptureKey(e) { if (e.key === 'Escape') exitCapture(); }
+    function onCaptureClick(e) {
+        if (!captureState) return;
+        const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+        if (!a) return;                 // let non-link clicks (e.g. the banner) pass
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        handleCapturePick(a);
+    }
+
+    function enterCapture(domain) {
+        captureState = { domain, step: 'topic' };
+        showCaptureBanner();
+        setBanner('Click the first thread / topic link in the list.  (Esc to cancel)');
+        document.addEventListener('click', onCaptureClick, true);
+        document.addEventListener('mouseover', onCaptureMove, true);
+        document.addEventListener('keydown', onCaptureKey, true);
+        try { document.body.style.cursor = 'crosshair'; } catch (_) {}
+    }
+    function exitCapture() {
+        document.removeEventListener('click', onCaptureClick, true);
+        document.removeEventListener('mouseover', onCaptureMove, true);
+        document.removeEventListener('keydown', onCaptureKey, true);
+        if (hoverEl) { hoverEl.style.outline = hoverEl._fsOldOutline || ''; hoverEl = null; }
+        try { document.body.style.cursor = ''; } catch (_) {}
+        if (captureBanner) { captureBanner.remove(); captureBanner = null; }
+        captureState = null;
+    }
+    function finishCaptureSoon() {
+        setTimeout(() => { exitCapture(); rescan(); }, 1600);
+    }
+
+    function handleCapturePick(a) {
+        const sites = getSites();
+        const cfg = sites[captureState.domain];
+        if (!cfg) { exitCapture(); return; }
+
+        if (captureState.step === 'topic') {
+            const sig = signature(a, true);
+            const cluster = clusterForSig(sig);
+            cfg.sig = sig;
+            cfg.pattern = cluster.length >= 3 ? deriveFromUrls(cluster.map(r => r.urlObj)) : null;
+            saveSites(sites);
+            setBanner('Got it — found ' + cluster.length + ' topic' + (cluster.length === 1 ? '' : 's') +
+                ' with that structure. Looking for the “next page” link…');
+            const nxt = detectNextPage(document, location.href, {}); // auto-detect only
+            if (nxt) {
+                setBanner('✓ Learned the topic links and found the “Next” link automatically. All set!', '#a6e3a1');
+                finishCaptureSoon();
+            } else {
+                captureState.step = 'next';
+                setBanner('Couldn’t find the “next page” link. Now click the link to page 2 of this list (or Cancel if there is none).');
+            }
+        } else {
+            cfg.nextSig = signature(a, true);
+            saveSites(sites);
+            setBanner('✓ Learned the next-page link. All set!', '#a6e3a1');
+            finishCaptureSoon();
+        }
+    }
+
+    function startGuidedTeach(domain) { enterCapture(domain); }
 
     // ---------------- UI: floating bar ----------------
     let bar;
+    let liveObserver = null;   // updates the topic count on a list page as content lazy-loads
+    let waitObserver = null;   // waits for a list to render, then shows the pill
+
     function buildBar() {
         if (bar) return bar;
         bar = document.createElement('div');
@@ -579,9 +741,10 @@
             const html = await fetchHtml(target);
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const site = getSiteFor(new URL(target).hostname);
-            const topics = detectForSite(doc, target, site ? site.cfg : null);
+            const cfg = site ? site.cfg : null;
+            const topics = detectForSite(doc, target, cfg);
             if (!topics) throw new Error('no topics in fetched page');
-            const newNext = detectNextPage(doc, target);
+            const newNext = detectNextPage(doc, target, cfg);
             const first = appendPage(tour, topics, newNext, target);
             if (!first) throw new Error('all duplicates');
             go(first);
@@ -605,65 +768,7 @@
             // users to the last-read post (/t/slug/123 → /t/slug/123/4). Fall back to a
             // prefix match with a separator so /topic/12 can't claim /topic/123.
             if (idx === -1) idx = tour.urls.findIndex(u => here.startsWith(u + '/') || here.startsWith(u + '?'));
-            if (idx !== -1) {
-                buildBar(); clearBar();
-
-                const title = mkTitle(tour.sourceTitle || 'Forum');
-                title.title = 'Back to: ' + (tour.sourceTitle || tour.source);
-                if (tour.source) title.addEventListener('click', () => go(tour.source));
-
-                const row = mkRow();
-                const back = mkBtn('◀', idx === 0 ? 'Back to index' : 'Previous topic');
-                const next = mkBtn('▶', 'Next topic');
-                const lbl = mkLabel(`${idx + 1} / ${tour.urls.length}`);
-                lbl.style.cursor = 'pointer';
-                lbl.title = 'Click to jump to a topic number';
-
-                // Click the counter -> inline number box -> Enter jumps to that topic.
-                lbl.addEventListener('click', () => {
-                    const input = document.createElement('input');
-                    input.type = 'number';
-                    input.min = '1'; input.max = String(tour.urls.length);
-                    input.value = String(idx + 1);
-                    Object.assign(input.style, {
-                        width: '58px', font: 'inherit', textAlign: 'center',
-                        borderRadius: '6px', border: '1px solid rgba(255,255,255,0.3)',
-                        background: '#fff', color: '#111'
-                    });
-                    let done = false;
-                    const commit = () => {
-                        if (done) return; done = true;
-                        const n = parseInt(input.value, 10);
-                        if (!isNaN(n) && n >= 1 && n <= tour.urls.length && n !== idx + 1) go(tour.urls[n - 1]);
-                        else input.replaceWith(lbl); // no-op / cancel -> restore label
-                    };
-                    input.addEventListener('keydown', (e) => {
-                        if (e.key === 'Enter') { e.preventDefault(); commit(); }
-                        else if (e.key === 'Escape') { done = true; input.replaceWith(lbl); }
-                    });
-                    input.addEventListener('blur', commit);
-                    lbl.replaceWith(input);
-                    input.focus(); input.select();
-                });
-
-                back.addEventListener('click', () => {
-                    if (idx > 0) go(tour.urls[idx - 1]);
-                    else if (tour.source) go(tour.source);
-                });
-
-                const isLast = idx === tour.urls.length - 1;
-                const canChain = AUTO_CHAIN && tour.nextPage;
-                if (isLast && canChain) { next.textContent = '⏭'; next.title = 'Pull next page → first new topic'; }
-                if (isLast && !canChain) { next.style.opacity = '0.4'; next.style.cursor = 'default'; }
-                next.addEventListener('click', () => {
-                    if (!isLast) go(tour.urls[idx + 1]);
-                    else if (canChain) pullNextPage(tour, next);
-                });
-
-                row.append(back, lbl, next);
-                bar.append(title, row);
-                return;
-            }
+            if (idx !== -1) { renderTourBar(tour, idx); return; }
         }
 
         // Not in a tour here. Scanning (and the Start pill) only happens inside the
@@ -671,13 +776,74 @@
         // anywhere on it when "whole site" is ticked).
         const site = getSiteFor(location.hostname);
         if (!site || !inScope(site.cfg, location.href)) return;
+        renderListPage(site, tour);
+    }
 
-        const topics = detectForSite(document, location.href, site.cfg);
+    function renderTourBar(tour, idx) {
+        buildBar(); clearBar();
+
+        const title = mkTitle(tour.sourceTitle || 'Forum');
+        title.title = 'Back to: ' + (tour.sourceTitle || tour.source);
+        if (tour.source) title.addEventListener('click', () => go(tour.source));
+
+        const row = mkRow();
+        const back = mkBtn('◀', idx === 0 ? 'Back to index' : 'Previous topic');
+        const next = mkBtn('▶', 'Next topic');
+        const lbl = mkLabel(`${idx + 1} / ${tour.urls.length}`);
+        lbl.style.cursor = 'pointer';
+        lbl.title = 'Click to jump to a topic number';
+
+        // Click the counter -> inline number box -> Enter jumps to that topic.
+        lbl.addEventListener('click', () => {
+            const input = document.createElement('input');
+            input.type = 'number';
+            input.min = '1'; input.max = String(tour.urls.length);
+            input.value = String(idx + 1);
+            Object.assign(input.style, {
+                width: '58px', font: 'inherit', textAlign: 'center',
+                borderRadius: '6px', border: '1px solid rgba(255,255,255,0.3)',
+                background: '#fff', color: '#111'
+            });
+            let done = false;
+            const commit = () => {
+                if (done) return; done = true;
+                const n = parseInt(input.value, 10);
+                if (!isNaN(n) && n >= 1 && n <= tour.urls.length && n !== idx + 1) go(tour.urls[n - 1]);
+                else input.replaceWith(lbl); // no-op / cancel -> restore label
+            };
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); commit(); }
+                else if (e.key === 'Escape') { done = true; input.replaceWith(lbl); }
+            });
+            input.addEventListener('blur', commit);
+            lbl.replaceWith(input);
+            input.focus(); input.select();
+        });
+
+        back.addEventListener('click', () => {
+            if (idx > 0) go(tour.urls[idx - 1]);
+            else if (tour.source) go(tour.source);
+        });
+
+        const isLast = idx === tour.urls.length - 1;
+        const canChain = AUTO_CHAIN && tour.nextPage;
+        if (isLast && canChain) { next.textContent = '⏭'; next.title = 'Pull next page → first new topic'; }
+        if (isLast && !canChain) { next.style.opacity = '0.4'; next.style.cursor = 'default'; }
+        next.addEventListener('click', () => {
+            if (!isLast) go(tour.urls[idx + 1]);
+            else if (canChain) pullNextPage(tour, next);
+        });
+
+        row.append(back, lbl, next);
+        bar.append(title, row);
+    }
+
+    function renderListPage(site, tour) {
+        const topics = detectForSite(document, location.href, site.cfg) || [];
         const resume = getResume();
 
-        if (topics && topics.length) {
-            const nextPage = detectNextPage(document, location.href);
-
+        if (topics.length) {
+            const nextPage = detectNextPage(document, location.href, site.cfg);
             // Arrived here as the fallback continuation of a running tour: append + jump in.
             if (resume === 'append' && tour && tour.urls) {
                 delResume();
@@ -685,21 +851,71 @@
                 if (first) { go(first); return; }
             }
             if (resume) delResume();
-
-            buildBar(); clearBar();
-            const row = mkRow();
-            const start = mkBtn(`📑 ${topics.length} topics — Start`, 'Capture these topics and open the first');
-            start.addEventListener('click', () => startTour(topics, nextPage));
-            const hide = mkBtn('✕', 'Hide');
-            hide.addEventListener('click', () => bar.remove());
-            row.append(start, hide);
-            bar.append(row);
-        } else if (resume) {
-            delResume(); // stale flag, nothing to continue here
+            buildStartPill(site);
+        } else {
+            if (resume) delResume();
+            startWaitObserver(site, tour);
         }
     }
 
+    // The capture pill: a live topic count (updates as lazy-loaded lists grow), a manual
+    // Re-scan button, Start, and Hide.
+    function buildStartPill(site) {
+        if (waitObserver) { waitObserver.disconnect(); waitObserver = null; }
+        buildBar(); clearBar();
+
+        const row = mkRow();
+        const start = mkBtn('📑 … — Start', 'Capture these topics and open the first');
+        const rescanBtn = mkBtn('🔄', 'Re-scan this page for more links (after scrolling)');
+        const hide = mkBtn('✕', 'Hide');
+        const latest = { topics: [], next: null };
+
+        const recompute = () => {
+            latest.topics = detectForSite(document, location.href, site.cfg) || [];
+            latest.next = detectNextPage(document, location.href, site.cfg);
+            const n = latest.topics.length;
+            start.textContent = `📑 ${n} topic${n === 1 ? '' : 's'} — Start`;
+            start.style.opacity = n ? '1' : '0.5';
+            start.style.cursor = n ? 'pointer' : 'default';
+        };
+        recompute();
+
+        start.addEventListener('click', () => { if (latest.topics.length) startTour(latest.topics, latest.next); });
+        rescanBtn.addEventListener('click', recompute);
+        hide.addEventListener('click', () => {
+            if (liveObserver) { liveObserver.disconnect(); liveObserver = null; }
+            bar.remove();
+        });
+
+        row.append(start, rescanBtn, hide);
+        bar.append(row);
+
+        // Live recount, event-driven (only fires when the DOM actually changes), throttled.
+        if (liveObserver) liveObserver.disconnect();
+        let t = null;
+        liveObserver = new MutationObserver(() => {
+            if (t) clearTimeout(t);
+            t = setTimeout(recompute, 700);
+        });
+        if (document.body) liveObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // No list yet (slow SPA render). Watch for DOM changes and try again; show the pill
+    // once a list appears. Gives up after 15s.
+    function startWaitObserver(site, tour) {
+        if (waitObserver || bar) return;
+        let t = null;
+        waitObserver = new MutationObserver(() => {
+            if (t) clearTimeout(t);
+            t = setTimeout(() => { if (!bar) renderListPage(site, tour); }, 500);
+        });
+        if (document.body) waitObserver.observe(document.body, { childList: true, subtree: true });
+        setTimeout(() => { if (waitObserver) { waitObserver.disconnect(); waitObserver = null; } }, 15000);
+    }
+
     function rescan() {
+        if (liveObserver) { liveObserver.disconnect(); liveObserver = null; }
+        if (waitObserver) { waitObserver.disconnect(); waitObserver = null; }
         if (bar) { bar.remove(); bar = null; }
         render();
     }
@@ -746,7 +962,7 @@
         descMain.textContent = 'Forum Stumbler only scans the sites listed here (opt-in). By default a site is scoped to the subforum pages you add; tick "whole site" to scan everywhere on it.';
         const descTeach = document.createElement('div');
         descTeach.style.cssText = 'margin-top: 4px; color: #6c7086; font-style: italic;';
-        descTeach.textContent = 'To teach a site: open a subforum page, click Teach, and paste any topic link from that page. The script finds it and uses the surrounding page structure as the template for topic links — the link itself is never stored.';
+        descTeach.textContent = 'To teach a site: open a subforum page, click Teach → "Pick on page", then click a topic link (and page 2 if asked). Nothing about the links is stored except the structure template.';
         desc.appendChild(descMain);
         desc.appendChild(descTeach);
 
@@ -804,23 +1020,40 @@
             while (teachArea.firstChild) teachArea.removeChild(teachArea.firstChild);
 
             const lbl = document.createElement('div');
-            lbl.style.cssText = 'font-size: 12px; color: #cdd6f4;';
-            lbl.textContent = 'Teach ' + domain + ' — paste a topic link that appears on the current page:';
+            lbl.style.cssText = 'font-size: 12px; color: #cdd6f4; font-weight: 600;';
+            lbl.textContent = 'Teach ' + domain;
 
-            const row = document.createElement('div');
-            row.style.cssText = 'display: flex; gap: 6px;';
+            const btnRow = document.createElement('div');
+            btnRow.style.cssText = 'display: flex; gap: 6px; align-items: center;';
+            const pickBtn = smallBtn('Pick on page', '#89b4fa');
+            pickBtn.title = 'Close settings, then click a topic link on the page (guided)';
+            pickBtn.addEventListener('click', () => { host.remove(); startGuidedTeach(domain); });
+            const pasteToggle = smallBtn('Paste a link instead', '#45475a', '#cdd6f4');
+            const cancelBtn = smallBtn('Cancel', '#45475a', '#cdd6f4');
+            cancelBtn.addEventListener('click', hideTeach);
+            btnRow.append(pickBtn, pasteToggle, cancelBtn);
+
+            // Paste fallback (topic structure only)
+            const pasteWrap = document.createElement('div');
+            pasteWrap.style.cssText = 'display: none; flex-direction: column; gap: 6px;';
+            const pasteRow = document.createElement('div');
+            pasteRow.style.cssText = 'display: flex; gap: 6px;';
             const tInput = document.createElement('input');
             tInput.type = 'text';
-            tInput.placeholder = 'https://…';
+            tInput.placeholder = 'Paste a topic link from the current page…';
             tInput.style.cssText = input.style.cssText;
             const analyzeBtn = smallBtn('Analyze', '#89b4fa');
-            const cancelBtn = smallBtn('Cancel', '#45475a', '#cdd6f4');
-            row.append(tInput, analyzeBtn, cancelBtn);
-
+            pasteRow.append(tInput, analyzeBtn);
             const result = document.createElement('div');
             result.style.cssText = 'font-size: 12px; line-height: 1.4; word-break: break-all;';
             const saveRow = document.createElement('div');
             saveRow.style.cssText = 'display: none; gap: 6px;';
+            pasteWrap.append(pasteRow, result, saveRow);
+
+            pasteToggle.addEventListener('click', () => {
+                pasteWrap.style.display = pasteWrap.style.display === 'none' ? 'flex' : 'none';
+                if (pasteWrap.style.display === 'flex') tInput.focus();
+            });
 
             function analyze() {
                 saveRow.style.display = 'none';
@@ -834,7 +1067,6 @@
                 result.style.color = res.count >= MIN_TAUGHT ? '#a6e3a1' : '#f9e2af';
                 result.textContent = 'Found ' + res.count + ' link' + (res.count === 1 ? '' : 's') +
                     ' sharing this page structure.' +
-                    (res.pattern ? ' Fallback URL pattern: ' + res.pattern : ' (No URL pattern derivable — will match by structure only.)') +
                     (res.count < MIN_TAUGHT ? ' That looks too few — try a different link, or Save anyway.' : '');
                 const saveBtn = smallBtn('Save', '#a6e3a1');
                 saveBtn.addEventListener('click', () => {
@@ -846,18 +1078,15 @@
                     }
                     hideTeach();
                     renderList();
-                    flashStatus('Saved structure template for ' + domain + '.');
+                    flashStatus('Saved topic structure for ' + domain + '.');
                 });
                 saveRow.appendChild(saveBtn);
                 saveRow.style.display = 'flex';
             }
-
             analyzeBtn.addEventListener('click', analyze);
             tInput.addEventListener('keydown', e => { if (e.key === 'Enter') analyze(); });
-            cancelBtn.addEventListener('click', hideTeach);
 
-            teachArea.append(lbl, row, result, saveRow);
-            tInput.focus();
+            teachArea.append(lbl, btnRow, pasteWrap);
         }
 
         function renderList() {
@@ -875,6 +1104,7 @@
             domains.forEach(d => {
                 const cfg = sites[d];
                 const onSite = h === d || h.endsWith('.' + d);
+                const taught = !!(cfg.sig || cfg.pattern);
 
                 const wrap = document.createElement('div');
                 wrap.style.cssText = 'display: flex; flex-direction: column; gap: 5px; background: #313244; border-radius: 6px; padding: 7px 10px;';
@@ -886,11 +1116,13 @@
                 label.textContent = d;
                 row.appendChild(label);
 
-                if (cfg.sig || cfg.pattern) {
+                if (taught) {
                     const badge = document.createElement('span');
                     badge.style.cssText = 'font-size: 11px; color: #a6e3a1; flex-shrink: 0;';
-                    badge.textContent = 'taught';
-                    badge.title = 'Structure: ' + (cfg.sig || '(none)') + (cfg.pattern ? '\nURL pattern: ' + cfg.pattern : '');
+                    badge.textContent = cfg.nextSig ? 'taught +next' : 'taught';
+                    badge.title = 'Structure: ' + (cfg.sig || '(none)') +
+                        (cfg.pattern ? '\nURL pattern: ' + cfg.pattern : '') +
+                        (cfg.nextSig ? '\nNext-page: ' + cfg.nextSig : '');
                     row.appendChild(badge);
                 }
 
@@ -912,9 +1144,9 @@
                 });
                 row.appendChild(allLbl);
 
-                const teachBtn = smallBtn((cfg.sig || cfg.pattern) ? 'Re-teach' : 'Teach', '#89b4fa');
+                const teachBtn = smallBtn(taught ? 'Re-teach' : 'Teach', '#89b4fa');
                 if (onSite) {
-                    teachBtn.title = 'Paste a topic link from the current page';
+                    teachBtn.title = 'Learn the topic-link structure from this page';
                     teachBtn.addEventListener('click', () => showTeach(d));
                 } else {
                     teachBtn.style.opacity = '0.4';
@@ -923,12 +1155,12 @@
                 }
                 row.appendChild(teachBtn);
 
-                if (cfg.sig || cfg.pattern) {
+                if (taught || cfg.nextSig) {
                     const forgetBtn = smallBtn('Forget', '#f9e2af');
                     forgetBtn.title = 'Forget the taught structure (falls back to auto-detection)';
                     forgetBtn.addEventListener('click', () => {
                         const s = getSites();
-                        if (s[d]) { s[d].sig = null; s[d].pattern = null; saveSites(s); }
+                        if (s[d]) { s[d].sig = null; s[d].pattern = null; s[d].nextSig = null; saveSites(s); }
                         renderList();
                         flashStatus('Forgot taught structure for ' + d + '.');
                     });
@@ -1026,7 +1258,7 @@
                 const pf = suggestPrefix(location.href);
                 if (pf) prefixes.push(pf);
             }
-            sites[d] = { all: false, prefixes, pattern: null, sig: null };
+            sites[d] = { all: false, prefixes, pattern: null, sig: null, nextSig: null };
             saveSites(sites);
             renderList();
             input.value = '';
@@ -1091,7 +1323,8 @@
                             all: (cfg && 'all' in cfg) ? !!cfg.all : true, // legacy entries were site-wide
                             prefixes: (cfg && Array.isArray(cfg.prefixes)) ? cfg.prefixes.filter(p => typeof p === 'string' && p) : [],
                             pattern: (cfg && typeof cfg.pattern === 'string') ? cfg.pattern : null,
-                            sig: (cfg && typeof cfg.sig === 'string') ? cfg.sig : null
+                            sig: (cfg && typeof cfg.sig === 'string') ? cfg.sig : null,
+                            nextSig: (cfg && typeof cfg.nextSig === 'string') ? cfg.nextSig : null
                         };
                         n++;
                     }
@@ -1131,23 +1364,7 @@
     });
 
     // ---------------- Boot ----------------
+    // render() shows the tour bar or the capture pill; if a list hasn't rendered yet on
+    // an in-scope page, renderListPage installs a MutationObserver to wait for it.
     render();
-    // Forums often lazy-render lists. If nothing was found yet inside an allowed
-    // scope, watch DOM changes for a while instead of a single fixed retry.
-    (() => {
-        if (bar) return;
-        const site = getSiteFor(location.hostname);
-        const tour = loadTour();
-        if (!(tour && tour.urls) && !(site && inScope(site.cfg, location.href))) return;
-        let settleTimer = null;
-        const mo = new MutationObserver(() => {
-            if (settleTimer) clearTimeout(settleTimer);
-            settleTimer = setTimeout(() => {
-                if (!bar) render();
-                if (bar) mo.disconnect();
-            }, 400);
-        });
-        if (document.body) mo.observe(document.body, { childList: true, subtree: true });
-        setTimeout(() => mo.disconnect(), 12000);
-    })();
 })();
