@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.10.0
+// @version     0.11.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
@@ -107,6 +107,30 @@
         return !!el.closest('.pagination, .pager, .pages, [class*="pagination"], [class*="pager"]');
     }
 
+    // Deep structural chain for exception matching: anchor-outward, up to 8 ancestors,
+    // ALL classes per level (digit-normalized, sorted for stability). Exceptions store
+    // the shortest prefix of this chain that discriminates, so deeper per-row variation
+    // (read/unread state classes on ancestors) doesn't break the match.
+    function sigDeep(a) {
+        const parts = [];
+        let el = a;
+        for (let i = 0; i < 8 && el && el.tagName && !/^(BODY|HTML)$/i.test(el.tagName); i++) {
+            let sig = el.tagName.toLowerCase();
+            const cls = (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean)
+                .map(c => c.replace(/\d+/g, '#')).sort().join('.');
+            if (cls) sig += '.' + cls;
+            parts.push(sig);
+            el = el.parentElement;
+        }
+        return parts.join('>');
+    }
+    const sigDeepMatches = (chain, prefix) => chain === prefix || chain.startsWith(prefix + '>');
+    function excludedBySig(a, prefixes) {
+        if (!prefixes || !prefixes.length) return false;
+        const c = sigDeep(a);
+        return prefixes.some(p => sigDeepMatches(c, p));
+    }
+
     function signature(a, useClasses) {
         // Structural fingerprint of an anchor: tag (+classes) chain of up to 4 ancestors.
         let parts = [];
@@ -139,7 +163,9 @@
                     pattern: typeof cfg.pattern === 'string' ? cfg.pattern : null,
                     sig: typeof cfg.sig === 'string' ? cfg.sig : null,
                     nextSig: typeof cfg.nextSig === 'string' ? cfg.nextSig : null,
-                    exclude: Array.isArray(cfg.exclude) ? cfg.exclude.filter(p => typeof p === 'string' && p) : []
+                    exclude: Array.isArray(cfg.exclude) ? cfg.exclude.filter(p => typeof p === 'string' && p) : [],
+                    excludeSigs: Array.isArray(cfg.excludeSigs) ? cfg.excludeSigs.filter(p => typeof p === 'string' && p) : [],
+                    goodSigs: Array.isArray(cfg.goodSigs) ? cfg.goodSigs.filter(p => typeof p === 'string' && p) : []
                 };
             }
             return out;
@@ -278,7 +304,7 @@
     // Taught URL pattern (secondary): match pathname+search against the stored regex.
     // Used when the taught structure isn't found (e.g. raw fetched HTML that differs
     // from the live DOM, or a theme change).
-    function detectByPattern(root, base, patternSrc) {
+    function detectByPattern(root, base, patternSrc, exSigs) {
         let rx;
         try { rx = new RegExp(patternSrc, 'i'); } catch (_) { return null; }
         base = base || location.href;
@@ -287,6 +313,7 @@
         const byUrl = new Map();
         for (const r of records) {
             if (!rx.test(r.urlObj.pathname + r.urlObj.search)) continue;
+            if (excludedBySig(r.a, exSigs)) continue;
             const prev = byUrl.get(r.url);
             if (!prev) byUrl.set(r.url, { url: r.url, text: r.text });
             else if (r.text.length > prev.text.length) prev.text = r.text; // keep the wordiest
@@ -297,7 +324,7 @@
 
     // Heuristic clustering (bootstrap for un-taught sites). Pass `onlySig` to restrict
     // to a taught structural signature instead of free scoring.
-    function detectTopics(root, base, onlySig) {
+    function detectTopics(root, base, onlySig, exSigs) {
         base = base || location.href;
         const records = collectAnchors(root, base, !onlySig);
         if (!records) return null;
@@ -306,6 +333,7 @@
             const byUrl = new Map();
             for (const r of records) {
                 if (signature(r.a, true) !== onlySig) continue;
+                if (excludedBySig(r.a, exSigs)) continue;
                 const prev = byUrl.get(r.url);
                 if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, { url: r.url, text: r.text });
             }
@@ -350,12 +378,13 @@
     function detectForSite(root, base, cfg) {
         if (cfg && (cfg.sig || cfg.pattern)) {
             const rxs = compileExcludes(cfg.exclude);
+            const exSigs = (cfg.excludeSigs && cfg.excludeSigs.length) ? cfg.excludeSigs : null;
             if (cfg.sig) {
-                const r = filterExcluded(detectTopics(root, base, cfg.sig), rxs);
+                const r = filterExcluded(detectTopics(root, base, cfg.sig, exSigs), rxs);
                 if (r && r.length >= MIN_TAUGHT) return r;
             }
             if (cfg.pattern) {
-                const r = filterExcluded(detectByPattern(root, base, cfg.pattern), rxs);
+                const r = filterExcluded(detectByPattern(root, base, cfg.pattern, exSigs), rxs);
                 if (r && r.length >= MIN_TAUGHT) return r;
             }
             return null;
@@ -496,11 +525,12 @@
     //    The next-page link is auto-detected and only asked for when that fails.
     //    Esc/Cancel exits with the rules left wiped.
     //  - Exceptions ('except'): runs on any page, no wipe. Highlights what the saved
-    //    rule catches there; each click on a wrong link either joins an existing
-    //    exception group (the merged rule un-highlights similar links) or starts a
-    //    new one. Save APPENDS the new rules to the stored ones — earlier exceptions
-    //    (possibly taught on other pages) survive. Esc/Cancel changes nothing.
-    let teach = null;        // { domain, mode: 'full'|'except', step: 'topic'|'verify'|'except'|'next', sig, pattern, baseExcludes, excludeGroups }
+    //    rule catches there; each click on a wrong link becomes a structural
+    //    (position) rule when the markup discriminates against the stored good
+    //    chains, else a URL-shape rule (grouped/merged as before). Save APPENDS the
+    //    new rules to the stored ones — earlier exceptions (possibly taught on other
+    //    pages) survive. Esc/Cancel changes nothing.
+    let teach = null;        // { domain, mode: 'full'|'except', step: 'topic'|'verify'|'except'|'next', sig, pattern, goodSigs, baseExcludes, baseExcludeSigs, excludeGroups, excludeSigs }
     let teachPopup = null;
     let hl = [];             // highlighted anchors, with their original outline to restore
     let hoverEl = null;
@@ -533,7 +563,8 @@
     }
     function includedRecords() {
         const rxs = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
-        return matchedRecords().filter(r => !excludedByRx(r.urlObj, rxs));
+        const exSigs = teach.baseExcludeSigs.concat(teach.excludeSigs);
+        return matchedRecords().filter(r => !excludedBySig(r.a, exSigs) && !excludedByRx(r.urlObj, rxs));
     }
 
     function clearHighlights() {
@@ -657,7 +688,10 @@
     }
 
     function startGuidedTeach(domain) {
-        teach = { domain, mode: 'full', step: 'topic', sig: null, pattern: null, baseExcludes: [], excludeGroups: [] };
+        teach = {
+            domain, mode: 'full', step: 'topic', sig: null, pattern: null, goodSigs: [],
+            baseExcludes: [], baseExcludeSigs: [], excludeGroups: [], excludeSigs: []
+        };
         enterCaptureMode();
         stepTopic();
     }
@@ -669,7 +703,10 @@
         teach = {
             domain, mode: 'except', step: 'except',
             sig: cfg.sig || null, pattern: cfg.pattern || null,
-            baseExcludes: (cfg.exclude || []).slice(), excludeGroups: []
+            goodSigs: (cfg.goodSigs || []).slice(),
+            baseExcludes: (cfg.exclude || []).slice(),
+            baseExcludeSigs: (cfg.excludeSigs || []).slice(),
+            excludeGroups: [], excludeSigs: []
         };
         enterCaptureMode();
         enterExcept();
@@ -770,7 +807,9 @@
         setPopup((typeof note === 'string' ? note + '  ' : '') +
             'These ' + inc.length + ' highlighted links are what the rule currently catches on this page. ' +
             'Click any that should NOT be included — similar links are removed with it. ' +
-            'New exceptions are ADDED to the existing ones.',
+            'New exceptions are ADDED to the existing ones.' +
+            (teach.goodSigs.length ? '' :
+                ' (This site was taught by an older version — re-teach the threads once to enable position-based exceptions.)'),
             [
                 ['Save ✓', '#a6e3a1', null, saveExceptions],
                 ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
@@ -781,25 +820,54 @@
         let uo;
         try { uo = new URL(a.href, location.href); } catch (_) { return; }
         const clickedUrl = norm(uo.href);
-        if (!includedRecords().some(r => r.url === clickedUrl)) return; // only highlighted links count
+        const incBefore = includedRecords();
+        if (!incBefore.some(r => r.url === clickedUrl)) return; // only highlighted links count
 
-        // Join an existing exception group when the merged rule stays specific (i.e.
-        // it still leaves some links highlighted); otherwise start a new group.
-        const rxsNow = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
-        let placed = false;
-        for (const g of teach.excludeGroups) {
-            const cand = deriveFromUrls(g.concat([uo]));
-            if (!cand) continue;
-            let rx;
-            try { rx = new RegExp(cand, 'i'); } catch (_) { continue; }
-            const remaining = matchedRecords().filter(r =>
-                !excludedByRx(r.urlObj, rxsNow) && !rx.test(r.urlObj.pathname + r.urlObj.search));
-            if (remaining.length > 0) { g.push(uo); placed = true; break; }
+        // Prefer a structural (position) exception: the shortest ancestry prefix of
+        // the clicked link that matches NONE of the good chains stored at teach time.
+        // Wrong links like "Last post: <thread>" carry a legitimate thread URL that
+        // changes constantly — only their markup position identifies them, and the
+        // known-good reference must come from the teach page because the wrong links
+        // often sit on pages (subforum indexes) with no good links to compare against.
+        // A prefix that keeps some on-page links highlighted is preferred; removing
+        // everything on this page is allowed only when stored good chains exist to
+        // prove real thread links live elsewhere in different markup.
+        const goods = teach.goodSigs || [];
+        const parts = sigDeep(a).split('>');
+        let withSurvivors = null, removesAll = null;
+        for (let d = 1; d <= parts.length; d++) {
+            const prefix = parts.slice(0, d).join('>');
+            if (goods.some(g => sigDeepMatches(g, prefix))) continue; // would hit known-good links
+            const survivors = incBefore.filter(r => !sigDeepMatches(sigDeep(r.a), prefix)).length;
+            if (survivors > 0) { withSurvivors = prefix; break; }
+            if (!removesAll && goods.length) removesAll = prefix;
         }
-        if (!placed) teach.excludeGroups.push([uo]);
+        const pick = withSurvivors || removesAll;
+        if (pick) {
+            if (!teach.excludeSigs.includes(pick)) teach.excludeSigs.push(pick);
+        } else {
+            // Structure doesn't discriminate (identical markup) — fall back to URL-shape
+            // rules. Join an existing exception group when the merged rule stays
+            // specific (still leaves some links highlighted); otherwise start a new group.
+            const rxsNow = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
+            const exSigsNow = teach.baseExcludeSigs.concat(teach.excludeSigs);
+            let placed = false;
+            for (const g of teach.excludeGroups) {
+                const cand = deriveFromUrls(g.concat([uo]));
+                if (!cand) continue;
+                let rx;
+                try { rx = new RegExp(cand, 'i'); } catch (_) { continue; }
+                const remaining = matchedRecords().filter(r =>
+                    !excludedBySig(r.a, exSigsNow) &&
+                    !excludedByRx(r.urlObj, rxsNow) && !rx.test(r.urlObj.pathname + r.urlObj.search));
+                if (remaining.length > 0) { g.push(uo); placed = true; break; }
+            }
+            if (!placed) teach.excludeGroups.push([uo]);
+        }
 
         const inc = includedRecords();
-        enterExcept(inc.length ? 'Removed.' : 'Removed — nothing is highlighted now; Cancel and re-teach if that went too far.');
+        enterExcept(inc.length ? 'Removed.' :
+            'Removed — nothing is highlighted on this page now. That is fine on a page with no real thread links; Cancel if it took too much.');
     }
 
     function confirmSave() {
@@ -809,6 +877,11 @@
             cfg.sig = teach.sig;
             cfg.pattern = teach.pattern;
             cfg.exclude = computeExcludePatterns();
+            cfg.excludeSigs = [];
+            // Remember the verified links' deep markup chains — the known-good
+            // reference that later lets an exception rule prove it only removes
+            // links in OTHER positions (even on pages with no good links).
+            cfg.goodSigs = Array.from(new Set(includedRecords().map(r => sigDeep(r.a)))).slice(0, 12);
             saveSites(sites);
         }
         clearHighlights();
@@ -825,17 +898,20 @@
 
     // Exceptions flow: append the new rules to the stored ones — never overwrite.
     function saveExceptions() {
-        const added = computeExcludePatterns();
-        if (added.length) {
+        const addedRx = computeExcludePatterns().filter(p => !teach.baseExcludes.includes(p));
+        const addedSigs = teach.excludeSigs.filter(s => !teach.baseExcludeSigs.includes(s));
+        const n = addedRx.length + addedSigs.length;
+        if (n) {
             const sites = getSites();
             const cfg = sites[teach.domain];
             if (cfg) {
-                cfg.exclude = teach.baseExcludes.concat(added.filter(p => !teach.baseExcludes.includes(p)));
+                cfg.exclude = teach.baseExcludes.concat(addedRx);
+                cfg.excludeSigs = teach.baseExcludeSigs.concat(addedSigs);
                 saveSites(sites);
             }
         }
-        finishTeach(added.length
-            ? '✓ Added ' + added.length + ' exception rule' + (added.length === 1 ? '' : 's') + '.'
+        finishTeach(n
+            ? '✓ Added ' + n + ' exception rule' + (n === 1 ? '' : 's') + '.'
             : 'No exceptions were added — nothing changed.');
     }
 
@@ -1326,12 +1402,14 @@
                 if (taught) {
                     const badge = document.createElement('span');
                     badge.style.cssText = 'font-size: 11px; color: #a6e3a1; flex-shrink: 0;';
+                    const nExcl = cfg.exclude.length + cfg.excludeSigs.length;
                     badge.textContent = 'taught' + (cfg.nextSig ? ' +next' : '') +
-                        (cfg.exclude.length ? ' +' + cfg.exclude.length + ' excl' : '');
+                        (nExcl ? ' +' + nExcl + ' excl' : '');
                     badge.title = 'Structure: ' + (cfg.sig || '(none)') +
                         (cfg.pattern ? '\nURL pattern: ' + cfg.pattern : '') +
                         (cfg.nextSig ? '\nNext-page: ' + cfg.nextSig : '') +
-                        (cfg.exclude.length ? '\nExceptions:\n' + cfg.exclude.join('\n') : '');
+                        (cfg.exclude.length ? '\nURL exceptions:\n' + cfg.exclude.join('\n') : '') +
+                        (cfg.excludeSigs.length ? '\nPosition exceptions:\n' + cfg.excludeSigs.join('\n') : '');
                     row.appendChild(badge);
                 }
 
@@ -1361,7 +1439,8 @@
                     teachBtn.addEventListener('click', () => {
                         const s = getSites();
                         if (s[d]) {
-                            s[d].sig = null; s[d].pattern = null; s[d].nextSig = null; s[d].exclude = [];
+                            s[d].sig = null; s[d].pattern = null; s[d].nextSig = null;
+                            s[d].exclude = []; s[d].excludeSigs = []; s[d].goodSigs = [];
                             saveSites(s);
                         }
                         host.remove();
@@ -1481,7 +1560,7 @@
                 const pf = suggestPrefix(location.href);
                 if (pf) prefixes.push(pf);
             }
-            sites[d] = { all: false, prefixes, pattern: null, sig: null, nextSig: null, exclude: [] };
+            sites[d] = { all: false, prefixes, pattern: null, sig: null, nextSig: null, exclude: [], excludeSigs: [], goodSigs: [] };
             saveSites(sites);
             renderList();
             input.value = '';
@@ -1548,7 +1627,9 @@
                             pattern: (cfg && typeof cfg.pattern === 'string') ? cfg.pattern : null,
                             sig: (cfg && typeof cfg.sig === 'string') ? cfg.sig : null,
                             nextSig: (cfg && typeof cfg.nextSig === 'string') ? cfg.nextSig : null,
-                            exclude: (cfg && Array.isArray(cfg.exclude)) ? cfg.exclude.filter(p => typeof p === 'string' && p) : []
+                            exclude: (cfg && Array.isArray(cfg.exclude)) ? cfg.exclude.filter(p => typeof p === 'string' && p) : [],
+                            excludeSigs: (cfg && Array.isArray(cfg.excludeSigs)) ? cfg.excludeSigs.filter(p => typeof p === 'string' && p) : [],
+                            goodSigs: (cfg && Array.isArray(cfg.goodSigs)) ? cfg.goodSigs.filter(p => typeof p === 'string' && p) : []
                         };
                         n++;
                     }
