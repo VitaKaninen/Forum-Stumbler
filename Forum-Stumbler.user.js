@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.6.0
+// @version     0.7.0
 // @author      VitaKaninen
-// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, with teachable per-site link patterns.
+// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site with subforum scoping and teachable, structure-based link detection.
 // @match       *://*/*
 // @grant       GM_setValue
 // @grant       GM_getValue
@@ -21,13 +21,15 @@
     if (window !== window.top) return; // top frame only
 
     // ---------------- Config ----------------
-    const TOUR_KEY = 'fs_tour';           // { urls, titles, source, sourceTitle, nextPage, ts }
-    const POS_KEY = 'fs_barpos';          // { right, bottom }
-    const RESUME_KEY = 'fs_resume';       // '' | 'append' — set when we navigate to a next page as a fallback
-    const SITES_KEY = 'fs_sites';         // { "<domain>": { pattern: string|null, sig: string|null } }
+    // Tour state is per-tab (sessionStorage): it lives as long as the tab and never
+    // leaks into other tabs. Position + site list are global (GM storage).
+    const TOUR_KEY = 'fs_tour';           // sessionStorage: { urls, titles, source, sourceTitle, nextPage, ts }
+    const RESUME_KEY = 'fs_resume';       // sessionStorage: '' | 'append' — set when we navigate to a next page as a fallback
+    const POS_KEY = 'fs_barpos';          // GM: { right, bottom }
+    const SITES_KEY = 'fs_sites';         // GM: { "<host>": { all, prefixes[], pattern, sig } }
     const AUTO_CHAIN = true;              // pull the forum's "next page" of results at end of a tour
     const MIN_CLUSTER = 4;                // heuristic: need at least this many links to call it a topic list
-    const MIN_TAUGHT = 2;                 // taught pattern/signature: trust smaller lists
+    const MIN_TAUGHT = 2;                 // taught signature/pattern: trust smaller lists
     const MIN_TITLE_LEN = 12;             // topic titles tend to be wordy
 
     // Known forum topic-URL patterns (a match makes a cluster near-certain).
@@ -46,7 +48,7 @@
     ];
 
     // Hrefs that are clearly NOT topics (nav/pagination/account/etc). Heuristic only —
-    // a taught pattern overrides this list.
+    // taught detection overrides this list.
     const NEGATIVE = /(\/login|\/logout|\/register|\/signup|\/sign-in|\/profile|\/members?\/|\/users?\/|\/tag[s]?\/|\/categor|\/forum[s]?\/?$|[?&]page=|\/page\/\d|[?&]start=\d|\/search|\/rss|\/feed|\.(png|jpe?g|gif|svg|css|js|pdf|zip)(\?|$))/i;
 
     // ---------------- Utilities ----------------
@@ -60,10 +62,20 @@
     };
 
     const loadTour = () => {
-        try { return JSON.parse(GM_getValue(TOUR_KEY, 'null')); } catch (_) { return null; }
+        try { return JSON.parse(sessionStorage.getItem(TOUR_KEY) || 'null'); } catch (_) { return null; }
     };
-    const saveTour = (t) => GM_setValue(TOUR_KEY, JSON.stringify(t));
+    const saveTour = (t) => { try { sessionStorage.setItem(TOUR_KEY, JSON.stringify(t)); } catch (_) {} };
+    const clearTourState = () => {
+        try { sessionStorage.removeItem(TOUR_KEY); sessionStorage.removeItem(RESUME_KEY); } catch (_) {}
+    };
+    const getResume = () => { try { return sessionStorage.getItem(RESUME_KEY) || ''; } catch (_) { return ''; } };
+    const setResume = (v) => { try { sessionStorage.setItem(RESUME_KEY, v); } catch (_) {} };
+    const delResume = () => { try { sessionStorage.removeItem(RESUME_KEY); } catch (_) {} };
     const go = (url) => { location.href = url; };
+
+    // One-time cleanup: tours lived in GM storage before 0.7.0.
+    if (GM_getValue(TOUR_KEY, null) !== null) GM_deleteValue(TOUR_KEY);
+    if (GM_getValue(RESUME_KEY, null) !== null) GM_deleteValue(RESUME_KEY);
 
     function inChrome(el) {
         // true if inside site chrome (nav/header/footer/aside) — not main content
@@ -93,24 +105,75 @@
         return parts.join('>');
     }
 
-    // ---------------- Site list (opt-in) ----------------
+    // ---------------- Site list (opt-in, with subforum scoping) ----------------
     function getSites() {
         try {
             const o = JSON.parse(GM_getValue(SITES_KEY, 'null'));
-            return (o && typeof o === 'object') ? o : {};
+            if (!o || typeof o !== 'object') return {};
+            const out = {};
+            for (const [d, c] of Object.entries(o)) {
+                const cfg = c || {};
+                out[d] = {
+                    all: ('all' in cfg) ? !!cfg.all : true, // pre-0.7 entries were site-wide
+                    prefixes: Array.isArray(cfg.prefixes) ? cfg.prefixes.filter(p => typeof p === 'string' && p) : [],
+                    pattern: typeof cfg.pattern === 'string' ? cfg.pattern : null,
+                    sig: typeof cfg.sig === 'string' ? cfg.sig : null
+                };
+            }
+            return out;
         } catch (_) { return {}; }
     }
     const saveSites = (s) => GM_setValue(SITES_KEY, JSON.stringify(s));
 
     const normDomain = (raw) => (raw || '').trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+    const normPrefix = (raw) => (raw || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
 
     function getSiteFor(hostname) {
         const sites = getSites();
         const h = (hostname || '').toLowerCase();
         for (const d of Object.keys(sites)) {
-            if (h === d || h.endsWith('.' + d)) return { domain: d, cfg: sites[d] || {} };
+            if (h === d || h.endsWith('.' + d)) return { domain: d, cfg: sites[d] };
         }
         return null;
+    }
+
+    // Scope matching: a prefix like "site.com/red-films-vf13" covers that subforum and
+    // its pagination ("…-vf13.htm", "…-vf13,25.htm") but not "…-vf139.htm" — after the
+    // prefix, the next character must be a separator.
+    const SCOPE_BOUNDARY = '/?&#.,';
+    const scopeKey = (u) => {
+        try {
+            const x = new URL(u);
+            return (x.host + x.pathname + x.search).toLowerCase().replace(/\/$/, '');
+        } catch (_) { return ''; }
+    };
+    function inScope(cfg, url) {
+        if (!cfg) return false;
+        if (cfg.all) return true;
+        const cur = scopeKey(url);
+        return (cfg.prefixes || []).some(p => {
+            const pf = normPrefix(p);
+            if (!pf || !cur.startsWith(pf)) return false;
+            return cur.length === pf.length || SCOPE_BOUNDARY.includes(cur[pf.length]);
+        });
+    }
+
+    // Suggest a scope prefix for the current page: strip common pagination markers and
+    // the file extension so page 1 and page N of a subforum share one prefix
+    // (e.g. /red-films-vf13.htm and /red-films-vf13,25.htm → site.com/red-films-vf13).
+    function suggestPrefix(u) {
+        try {
+            const x = new URL(u);
+            let path = x.pathname
+                .replace(/,\d+(?=\.\w+$)/, '')          // flat-style page suffix: name,25.htm
+                .replace(/\.(html?|php|aspx?|cgi)$/i, '')
+                .replace(/\/page[-/]?\d+\/?$/i, '')     // /page-2, /page/2
+                .replace(/\/$/, '');
+            const params = new URLSearchParams(x.search);
+            ['page', 'paged', 'start', 'offset', 'p', 'pg'].forEach(k => params.delete(k));
+            const q = params.toString();
+            return (x.host + path + (q ? '?' + q : '')).toLowerCase();
+        } catch (_) { return ''; }
     }
 
     // ---------------- Detection ----------------
@@ -118,8 +181,8 @@
     // document's own URL so relative hrefs resolve correctly.
 
     // Shared anchor filter: same-site, not the current page, not pagination, has a
-    // title-ish text. `applyNegative` is skipped for taught patterns (the pattern is
-    // the authority there).
+    // title-ish text. `applyNegative` is skipped for taught detection (the taught
+    // structure/pattern is the authority there).
     function collectAnchors(root, base, applyNegative) {
         let baseOrigin;
         try { baseOrigin = new URL(base).origin; } catch (_) { return null; }
@@ -144,8 +207,9 @@
         return records;
     }
 
-    // Taught pattern: match pathname+search of every anchor against the stored regex.
-    // Survives fetched raw HTML (no live-DOM structure needed) and theme changes.
+    // Taught URL pattern (secondary): match pathname+search against the stored regex.
+    // Used when the taught structure isn't found (e.g. raw fetched HTML that differs
+    // from the live DOM, or a theme change).
     function detectByPattern(root, base, patternSrc) {
         let rx;
         try { rx = new RegExp(patternSrc, 'i'); } catch (_) { return null; }
@@ -167,18 +231,17 @@
     // to a taught structural signature instead of free scoring.
     function detectTopics(root, base, onlySig) {
         base = base || location.href;
-        const records = collectAnchors(root, base, true);
+        const records = collectAnchors(root, base, !onlySig);
         if (!records) return null;
 
         if (onlySig) {
-            const seen = new Set();
-            const uniq = [];
+            const byUrl = new Map();
             for (const r of records) {
                 if (signature(r.a, true) !== onlySig) continue;
-                if (seen.has(r.url)) continue;
-                seen.add(r.url);
-                uniq.push({ url: r.url, text: r.text });
+                const prev = byUrl.get(r.url);
+                if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, { url: r.url, text: r.text });
             }
+            const uniq = Array.from(byUrl.values());
             return uniq.length >= MIN_TAUGHT ? uniq : null;
         }
 
@@ -212,16 +275,16 @@
         return bestCluster(true) || bestCluster(false);
     }
 
-    // Detection order for an opted-in site: taught URL pattern → taught structural
-    // signature → generic heuristic.
+    // Detection order for an opted-in site: taught page structure → taught URL
+    // pattern → generic heuristic.
     function detectForSite(root, base, cfg) {
-        if (cfg && cfg.pattern) {
-            const r = detectByPattern(root, base, cfg.pattern);
-            if (r && r.length >= MIN_TAUGHT) return r;
-        }
         if (cfg && cfg.sig) {
             const r = detectTopics(root, base, cfg.sig);
             if (r) return r;
+        }
+        if (cfg && cfg.pattern) {
+            const r = detectByPattern(root, base, cfg.pattern);
+            if (r && r.length >= MIN_TAUGHT) return r;
         }
         return detectTopics(root, base);
     }
@@ -260,39 +323,52 @@
     }
 
     // ---------------- Teaching ----------------
-    // From one example topic URL pasted by the user, derive a reusable URL pattern for
-    // the site. The example itself is never stored — only the generalized pattern and
-    // the anchor's structural signature.
+    // Structure-first: from one example topic link pasted by the user, find that
+    // anchor on the page, take its structural signature, and treat every anchor
+    // sharing that structure as the topic list. A URL pattern is additionally derived
+    // from that structural cluster as a fallback for fetched pages / theme changes.
+    // The example link itself is never stored.
     const escRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pathSegs = (p) => p.replace(/\/+$/, '').split('/').filter(Boolean);
 
-    function generalizeSeg(vals, seg, isFirst) {
-        if (vals && vals.length > 1) {
-            // cluster-derived: this path position varies across topic links
-            if (vals.every(v => /^\d+$/.test(v))) return '\\d+';
-            if (vals.every(v => /\.\d+$/.test(v))) return '[^/]+\\.\\d+';   // XenForo: title.12345
-            if (vals.every(v => /^\d+-/.test(v))) return '\\d+-[^/]+';      // id-title
-            return '[^/]+';
+    // Generalize a set of differing values at one path position into a regex piece:
+    // digit runs become \d+, then the longest common prefix/suffix stays literal and
+    // the varying middle becomes [^/]*.
+    // e.g. ["niski-przelot-vt623031.htm", "chodnikiem-vt623002.htm"] → "[^/]*-vt\d+\.htm"
+    function generalizeVals(vals) {
+        if (vals.every(v => /^\d+$/.test(v))) return '\\d+';
+        const t = vals.map(v => v.replace(/\d+/g, ' '));
+        let pre = t[0];
+        for (const s of t) {
+            let i = 0;
+            while (i < pre.length && i < s.length && pre[i] === s[i]) i++;
+            pre = pre.slice(0, i);
         }
-        if (vals && vals.length === 1) return escRx(vals[0]);               // constant across cluster
-        // single-example fallback: keep the leading section literal, generalize the rest
-        if (isFirst) return escRx(seg);
-        if (/^\d+$/.test(seg)) return '\\d+';
-        if (/\.\d+$/.test(seg)) return '[^/]+\\.\\d+';
-        if (/^\d+-/.test(seg)) return '\\d+-[^/]+';
-        return '[^/]+';
+        let suf = t[0];
+        for (const s of t) {
+            let i = 0;
+            while (i < suf.length && i < s.length && suf[suf.length - 1 - i] === s[s.length - 1 - i]) i++;
+            suf = suf.slice(suf.length - i);
+        }
+        const minLen = Math.min.apply(null, t.map(s => s.length));
+        if (pre.length + suf.length > minLen) suf = suf.slice(pre.length + suf.length - minLen);
+        const mid = t.every(s => s.length === pre.length + suf.length) ? '' : '[^/]*';
+        const conv = (s) => s.split(' ').map(escRx).join('\\d+');
+        return conv(pre) + mid + conv(suf);
     }
 
-    function derivePattern(exUrl, cluster) {
-        const exSegsList = pathSegs(exUrl.pathname);
-        const useCluster = cluster.length >= 3;
-        const parts = exSegsList.map((seg, i) => {
-            let vals = null;
-            if (useCluster) vals = Array.from(new Set(cluster.map(u => pathSegs(u.pathname)[i])));
-            return generalizeSeg(vals, seg, i === 0);
-        });
-        let src = exSegsList.length ? '^/' + parts.join('/') : '^/';
-        if (exUrl.search) src += escRx(exUrl.search).replace(/\d+/g, '\\d+');
+    function deriveFromUrls(urls) {
+        const segLists = urls.map(u => pathSegs(u.pathname));
+        const depth = segLists[0].length;
+        if (!depth || !segLists.every(s => s.length === depth)) return null;
+        const parts = [];
+        for (let i = 0; i < depth; i++) {
+            const vals = Array.from(new Set(segLists.map(s => s[i])));
+            parts.push(vals.length === 1 ? escRx(vals[0]) : generalizeVals(vals));
+        }
+        let src = '^/' + parts.join('/');
+        const searches = urls.map(u => u.search);
+        if (searches.every(s => s)) src += escRx(searches[0]).replace(/\d+/g, '\\d+');
         return src;
     }
 
@@ -305,40 +381,34 @@
             return { error: 'That link is on a different site (' + exUrl.hostname + ') — open that forum first.' };
         }
         const ex = norm(exUrl.href);
-        const anchors = Array.from(document.querySelectorAll('a[href]')).filter(a => {
-            const raw = a.getAttribute('href');
-            if (!raw || raw.startsWith('#') || /^(javascript|mailto|tel):/i.test(raw)) return false;
-            try { return norm(new URL(raw, location.href).href) === ex; } catch (_) { return false; }
-        });
-        if (!anchors.length) {
-            return { error: 'That link is not on this page — open the index page that lists it, then teach.' };
+        const records = collectAnchors(document, location.href, false) || [];
+        const matches = records.filter(r => r.url === ex);
+        if (!matches.length) {
+            const rawPresent = Array.from(document.querySelectorAll('a[href]')).some(a => {
+                try { return norm(new URL(a.getAttribute('href'), location.href).href) === ex; } catch (_) { return false; }
+            });
+            return {
+                error: rawPresent
+                    ? 'That link is filtered out as site navigation/pagination here — paste a topic-title link instead.'
+                    : 'That link is not on this page — open the index page that lists it, then teach.'
+            };
         }
         // The same topic often has several anchors (title, last-post); the wordiest one
         // is the title link.
-        const example = anchors.reduce((p, c) =>
-            (c.textContent || '').trim().length >= (p.textContent || '').trim().length ? c : p);
-        const sig = signature(example, true);
+        const example = matches.reduce((p, c) => (c.text.length >= p.text.length ? c : p));
+        const sig = signature(example.a, true);
 
-        // Cluster of same-shaped URLs on this page (same depth + same leading segment):
-        // lets derivePattern see which path positions actually vary.
-        const exSegsList = pathSegs(exUrl.pathname);
-        const cluster = [];
-        for (const a of document.querySelectorAll('a[href]')) {
-            const raw = a.getAttribute('href');
-            if (!raw || raw.startsWith('#') || /^(javascript|mailto|tel):/i.test(raw)) continue;
-            let u;
-            try { u = new URL(raw, location.href); } catch (_) { continue; }
-            if (u.origin !== exUrl.origin) continue;
-            const s = pathSegs(u.pathname);
-            if (s.length !== exSegsList.length) continue;
-            if (exSegsList.length && s[0] !== exSegsList[0]) continue;
-            if (!!u.search !== !!exUrl.search) continue;
-            cluster.push(u);
+        // Structural cluster: every anchor on the page built the same way.
+        const byUrl = new Map();
+        for (const r of records) {
+            if (signature(r.a, true) !== sig) continue;
+            const prev = byUrl.get(r.url);
+            if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
         }
-
-        const pattern = derivePattern(exUrl, cluster);
-        const count = (detectByPattern(document, location.href, pattern) || []).length;
-        return { pattern, sig, count };
+        const cluster = Array.from(byUrl.values());
+        const count = cluster.length;
+        const pattern = count >= 3 ? deriveFromUrls(cluster.map(r => r.urlObj)) : null;
+        return { sig, pattern, count };
     }
 
     // ---------------- UI: floating bar ----------------
@@ -517,20 +587,18 @@
             go(first);
         } catch (_) {
             // Fallback: navigate to the next page visibly, then auto-append on load.
-            GM_setValue(RESUME_KEY, 'append');
+            setResume('append');
             go(target);
         }
     }
 
     // ---------------- Render ----------------
     function render() {
-        const site = getSiteFor(location.hostname);
-        if (!site) return; // opt-in: dormant on unlisted sites (add via menu → Settings)
-
         const tour = loadTour();
         const here = norm(location.href);
 
-        // On a topic that belongs to the active tour?
+        // A running tour owns its pages regardless of scan scope: it was started from
+        // an allowed index page, lives only in this tab, and dies with it.
         if (tour && tour.urls) {
             let idx = tour.urls.indexOf(here);
             // Forums may redirect a stored topic URL deeper — Discourse sends logged-in
@@ -598,20 +666,25 @@
             }
         }
 
-        // Not in a tour here — is this a list page?
+        // Not in a tour here. Scanning (and the Start pill) only happens inside the
+        // designated scope: an opted-in site, on an allowed subforum prefix (or
+        // anywhere on it when "whole site" is ticked).
+        const site = getSiteFor(location.hostname);
+        if (!site || !inScope(site.cfg, location.href)) return;
+
         const topics = detectForSite(document, location.href, site.cfg);
-        const resume = GM_getValue(RESUME_KEY, '');
+        const resume = getResume();
 
         if (topics && topics.length) {
             const nextPage = detectNextPage(document, location.href);
 
             // Arrived here as the fallback continuation of a running tour: append + jump in.
             if (resume === 'append' && tour && tour.urls) {
-                GM_deleteValue(RESUME_KEY);
+                delResume();
                 const first = appendPage(tour, topics, nextPage, location.href);
                 if (first) { go(first); return; }
             }
-            if (resume) GM_deleteValue(RESUME_KEY);
+            if (resume) delResume();
 
             buildBar(); clearBar();
             const row = mkRow();
@@ -622,7 +695,7 @@
             row.append(start, hide);
             bar.append(row);
         } else if (resume) {
-            GM_deleteValue(RESUME_KEY); // stale flag, nothing to continue here
+            delResume(); // stale flag, nothing to continue here
         }
     }
 
@@ -658,7 +731,7 @@
         const panel = document.createElement('div');
         panel.style.cssText = `
             background: #1e1e2e; color: #cdd6f4; border-radius: 10px;
-            padding: 20px 24px; width: 480px; max-height: 80vh;
+            padding: 20px 24px; width: 520px; max-height: 85vh;
             display: flex; flex-direction: column; gap: 12px;
             box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden;
         `;
@@ -670,10 +743,10 @@
         const desc = document.createElement('div');
         desc.style.cssText = 'font-size: 12px; color: #9399b2; line-height: 1.45;';
         const descMain = document.createElement('div');
-        descMain.textContent = 'Forum Stumbler only runs on the sites listed here (opt-in). Everywhere else it stays dormant.';
+        descMain.textContent = 'Forum Stumbler only scans the sites listed here (opt-in). By default a site is scoped to the subforum pages you add; tick "whole site" to scan everywhere on it.';
         const descTeach = document.createElement('div');
         descTeach.style.cssText = 'margin-top: 4px; color: #6c7086; font-style: italic;';
-        descTeach.textContent = 'To teach a site its topic-link shape: open its topic-list page, click Teach, and paste any topic link from that page. Only the derived pattern is stored — never the link itself.';
+        descTeach.textContent = 'To teach a site: open a subforum page, click Teach, and paste any topic link from that page. The script finds it and uses the surrounding page structure as the template for topic links — the link itself is never stored.';
         desc.appendChild(descMain);
         desc.appendChild(descTeach);
 
@@ -697,14 +770,14 @@
         `;
         const addBtn = smallBtn('Add', '#89b4fa');
         const addCurrentBtn = smallBtn('+ This Site', '#a6e3a1');
-        addCurrentBtn.title = 'Add the current site (' + location.hostname + ')';
+        addCurrentBtn.title = 'Add the current site (' + location.hostname + '), scoped to the current page';
         addRow.append(input, addBtn, addCurrentBtn);
 
         // Site list
         const list = document.createElement('div');
         list.style.cssText = `
-            overflow-y: auto; display: flex; flex-direction: column; gap: 5px;
-            flex: 1; min-height: 0; max-height: 40vh; padding-right: 4px;
+            overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+            flex: 1; min-height: 0; max-height: 45vh; padding-right: 4px;
         `;
 
         // Teach area (shown when a site's Teach button is clicked)
@@ -759,17 +832,21 @@
                     return;
                 }
                 result.style.color = res.count >= MIN_TAUGHT ? '#a6e3a1' : '#f9e2af';
-                result.textContent = 'Pattern: ' + res.pattern + ' — matches ' + res.count +
-                    ' link' + (res.count === 1 ? '' : 's') + ' on this page.' +
+                result.textContent = 'Found ' + res.count + ' link' + (res.count === 1 ? '' : 's') +
+                    ' sharing this page structure.' +
+                    (res.pattern ? ' Fallback URL pattern: ' + res.pattern : ' (No URL pattern derivable — will match by structure only.)') +
                     (res.count < MIN_TAUGHT ? ' That looks too few — try a different link, or Save anyway.' : '');
-                const saveBtn = smallBtn('Save pattern', '#a6e3a1');
+                const saveBtn = smallBtn('Save', '#a6e3a1');
                 saveBtn.addEventListener('click', () => {
                     const sites = getSites();
-                    sites[domain] = { pattern: res.pattern, sig: res.sig };
-                    saveSites(sites);
+                    if (sites[domain]) {
+                        sites[domain].sig = res.sig;
+                        sites[domain].pattern = res.pattern;
+                        saveSites(sites);
+                    }
                     hideTeach();
                     renderList();
-                    flashStatus('Saved pattern for ' + domain + '.');
+                    flashStatus('Saved structure template for ' + domain + '.');
                 });
                 saveRow.appendChild(saveBtn);
                 saveRow.style.display = 'flex';
@@ -796,46 +873,64 @@
             }
             const h = location.hostname.toLowerCase();
             domains.forEach(d => {
-                const cfg = sites[d] || {};
+                const cfg = sites[d];
+                const onSite = h === d || h.endsWith('.' + d);
+
+                const wrap = document.createElement('div');
+                wrap.style.cssText = 'display: flex; flex-direction: column; gap: 5px; background: #313244; border-radius: 6px; padding: 7px 10px;';
+
                 const row = document.createElement('div');
-                row.style.cssText = `
-                    display: flex; align-items: center; gap: 6px;
-                    background: #313244; border-radius: 6px; padding: 6px 10px;
-                `;
+                row.style.cssText = 'display: flex; align-items: center; gap: 6px;';
                 const label = document.createElement('span');
-                label.style.cssText = 'font-size: 13px; word-break: break-all; flex: 1;';
+                label.style.cssText = 'font-size: 13px; word-break: break-all; flex: 1; font-weight: 600;';
                 label.textContent = d;
                 row.appendChild(label);
 
-                if (cfg.pattern) {
+                if (cfg.sig || cfg.pattern) {
                     const badge = document.createElement('span');
                     badge.style.cssText = 'font-size: 11px; color: #a6e3a1; flex-shrink: 0;';
                     badge.textContent = 'taught';
-                    badge.title = 'Pattern: ' + cfg.pattern;
+                    badge.title = 'Structure: ' + (cfg.sig || '(none)') + (cfg.pattern ? '\nURL pattern: ' + cfg.pattern : '');
                     row.appendChild(badge);
                 }
 
-                const onSite = h === d || h.endsWith('.' + d);
-                const teachBtn = smallBtn(cfg.pattern ? 'Re-teach' : 'Teach', '#89b4fa');
+                // "whole site" toggle
+                const allLbl = document.createElement('label');
+                allLbl.style.cssText = 'display: flex; align-items: center; gap: 4px; font-size: 12px; color: #9399b2; cursor: pointer; flex-shrink: 0;';
+                const allCb = document.createElement('input');
+                allCb.type = 'checkbox';
+                allCb.checked = !!cfg.all;
+                allCb.style.cssText = 'accent-color: #89b4fa; cursor: pointer;';
+                const allTxt = document.createElement('span');
+                allTxt.textContent = 'whole site';
+                allLbl.title = 'Scan everywhere on this site instead of only the listed pages';
+                allLbl.append(allCb, allTxt);
+                allCb.addEventListener('change', () => {
+                    const s = getSites();
+                    if (s[d]) { s[d].all = allCb.checked; saveSites(s); }
+                    renderList();
+                });
+                row.appendChild(allLbl);
+
+                const teachBtn = smallBtn((cfg.sig || cfg.pattern) ? 'Re-teach' : 'Teach', '#89b4fa');
                 if (onSite) {
                     teachBtn.title = 'Paste a topic link from the current page';
                     teachBtn.addEventListener('click', () => showTeach(d));
                 } else {
                     teachBtn.style.opacity = '0.4';
                     teachBtn.style.cursor = 'default';
-                    teachBtn.title = 'Open a topic-list page on ' + d + ' to teach it';
+                    teachBtn.title = 'Open a subforum page on ' + d + ' to teach it';
                 }
                 row.appendChild(teachBtn);
 
-                if (cfg.pattern) {
+                if (cfg.sig || cfg.pattern) {
                     const forgetBtn = smallBtn('Forget', '#f9e2af');
-                    forgetBtn.title = 'Forget the taught pattern (falls back to auto-detection)';
+                    forgetBtn.title = 'Forget the taught structure (falls back to auto-detection)';
                     forgetBtn.addEventListener('click', () => {
                         const s = getSites();
-                        s[d] = { pattern: null, sig: null };
-                        saveSites(s);
+                        if (s[d]) { s[d].sig = null; s[d].pattern = null; saveSites(s); }
                         renderList();
-                        flashStatus('Forgot pattern for ' + d + '.');
+                        flashStatus('Forgot taught structure for ' + d + '.');
                     });
                     row.appendChild(forgetBtn);
                 }
@@ -854,31 +949,101 @@
                     renderList();
                 });
                 row.appendChild(removeBtn);
+                wrap.appendChild(row);
 
-                list.appendChild(row);
+                // Scoped: list the allowed page prefixes + an add row
+                if (!cfg.all) {
+                    cfg.prefixes.forEach((p, i) => {
+                        const pRow = document.createElement('div');
+                        pRow.style.cssText = 'display: flex; align-items: center; gap: 6px; padding-left: 12px;';
+                        const pLabel = document.createElement('span');
+                        pLabel.style.cssText = 'font-size: 12px; color: #9399b2; word-break: break-all; flex: 1;';
+                        pLabel.textContent = p;
+                        const pRemove = document.createElement('button');
+                        pRemove.textContent = '✕';
+                        pRemove.style.cssText = 'background: none; border: none; color: #f38ba8; cursor: pointer; font-size: 12px; padding: 0 4px; flex-shrink: 0;';
+                        pRemove.title = 'Remove this page prefix';
+                        pRemove.addEventListener('click', () => {
+                            const s = getSites();
+                            if (s[d]) { s[d].prefixes = s[d].prefixes.filter((_, j) => j !== i); saveSites(s); }
+                            renderList();
+                        });
+                        pRow.append(pLabel, pRemove);
+                        wrap.appendChild(pRow);
+                    });
+
+                    if (!cfg.prefixes.length) {
+                        const note = document.createElement('div');
+                        note.style.cssText = 'font-size: 11px; color: #f9e2af; padding-left: 12px;';
+                        note.textContent = 'Inactive — add a page below or tick "whole site".';
+                        wrap.appendChild(note);
+                    }
+
+                    const pAddRow = document.createElement('div');
+                    pAddRow.style.cssText = 'display: flex; gap: 6px; padding-left: 12px;';
+                    const pInput = document.createElement('input');
+                    pInput.type = 'text';
+                    pInput.placeholder = 'e.g. ' + d + '/some-subforum';
+                    pInput.style.cssText = input.style.cssText + 'font-size: 12px; padding: 4px 8px;';
+                    const pAddBtn = smallBtn('Add', '#89b4fa');
+                    const pCurBtn = smallBtn('This Page', '#a6e3a1');
+                    pCurBtn.title = onSite
+                        ? 'Fill in the current page (pagination markers stripped) — review, then Add'
+                        : 'Open a page on ' + d + ' first';
+                    if (onSite) {
+                        pCurBtn.addEventListener('click', () => { pInput.value = suggestPrefix(location.href); pInput.focus(); });
+                    } else {
+                        pCurBtn.style.opacity = '0.4';
+                        pCurBtn.style.cursor = 'default';
+                    }
+                    const addPrefix = () => {
+                        const pf = normPrefix(pInput.value);
+                        if (!pf) return;
+                        const s = getSites();
+                        if (!s[d]) return;
+                        if (s[d].prefixes.includes(pf)) { flashStatus('Already listed.', '#f9e2af'); return; }
+                        s[d].prefixes.push(pf);
+                        saveSites(s);
+                        renderList();
+                    };
+                    pAddBtn.addEventListener('click', addPrefix);
+                    pInput.addEventListener('keydown', e => { if (e.key === 'Enter') addPrefix(); });
+                    pAddRow.append(pInput, pAddBtn, pCurBtn);
+                    wrap.appendChild(pAddRow);
+                }
+
+                list.appendChild(wrap);
             });
         }
 
-        function addSite(raw) {
+        function addSite(raw, fromCurrentPage) {
             const d = normDomain(raw);
             if (!d) return;
             const sites = getSites();
             if (sites[d]) { flashStatus('Already listed.', '#f9e2af'); return; }
-            sites[d] = { pattern: null, sig: null };
+            const prefixes = [];
+            if (fromCurrentPage) {
+                const pf = suggestPrefix(location.href);
+                if (pf) prefixes.push(pf);
+            }
+            sites[d] = { all: false, prefixes, pattern: null, sig: null };
             saveSites(sites);
             renderList();
             input.value = '';
+            flashStatus(fromCurrentPage && prefixes.length
+                ? 'Added ' + d + ', scoped to ' + prefixes[0]
+                : 'Added ' + d + ' — now add a page prefix or tick "whole site".');
         }
 
-        addBtn.addEventListener('click', () => addSite(input.value));
-        input.addEventListener('keydown', e => { if (e.key === 'Enter') addSite(input.value); });
-        addCurrentBtn.addEventListener('click', () => addSite(location.hostname));
+        addBtn.addEventListener('click', () => addSite(input.value, false));
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') addSite(input.value, false); });
+        addCurrentBtn.addEventListener('click', () => addSite(location.hostname, true));
 
-        // Import / Export (whole config: sites + taught patterns, as JSON)
+        // Import / Export (whole config: sites, scopes, taught structures, as JSON)
         const ioRow = document.createElement('div');
         ioRow.style.cssText = 'display: flex; gap: 6px; align-items: center;';
         const exportBtn = smallBtn('Export', '#fab387');
-        exportBtn.title = 'Download the site list (with taught patterns) as a .json file';
+        exportBtn.title = 'Download the site list (with scopes and taught structures) as a .json file';
         const importBtn = smallBtn('Import', '#f9e2af');
         importBtn.title = 'Load a .json file and merge with the existing list';
 
@@ -919,10 +1084,12 @@
                     if (!incoming) { flashStatus('Not a valid sites file.', '#f38ba8'); return; }
                     const sites = getSites();
                     let n = 0;
-                    for (const [d, cfg] of Object.entries(incoming)) {
-                        const dom = normDomain(String(d));
+                    for (const [dRaw, cfg] of Object.entries(incoming)) {
+                        const dom = normDomain(String(dRaw));
                         if (!dom) continue;
                         sites[dom] = {
+                            all: (cfg && 'all' in cfg) ? !!cfg.all : true, // legacy entries were site-wide
+                            prefixes: (cfg && Array.isArray(cfg.prefixes)) ? cfg.prefixes.filter(p => typeof p === 'string' && p) : [],
                             pattern: (cfg && typeof cfg.pattern === 'string') ? cfg.pattern : null,
                             sig: (cfg && typeof cfg.sig === 'string') ? cfg.sig : null
                         };
@@ -944,7 +1111,7 @@
 
         const closeBtn = smallBtn('Close', '#45475a', '#cdd6f4');
         closeBtn.style.alignSelf = 'flex-end';
-        const closeAll = () => { host.remove(); rescan(); }; // re-scan so a just-added site lights up immediately
+        const closeAll = () => { host.remove(); rescan(); }; // re-scan so a just-added scope lights up immediately
         closeBtn.addEventListener('click', closeAll);
         overlay.addEventListener('click', e => { if (e.target === overlay) closeAll(); });
 
@@ -958,16 +1125,20 @@
     // ---------------- Menu commands ----------------
     GM_registerMenuCommand('Forum Stumbler: settings', openSettings);
     GM_registerMenuCommand('Forum Stumbler: re-scan this page', rescan);
-    GM_registerMenuCommand('Forum Stumbler: clear saved tour', () => {
-        GM_deleteValue(TOUR_KEY); GM_deleteValue(RESUME_KEY);
+    GM_registerMenuCommand('Forum Stumbler: clear this tab’s tour', () => {
+        clearTourState();
         if (bar) { bar.remove(); bar = null; }
     });
 
     // ---------------- Boot ----------------
     render();
-    // Forums often lazy-render lists. If nothing was found yet on an opted-in site,
-    // watch DOM changes for a while instead of a single fixed retry.
-    if (getSiteFor(location.hostname) && !bar) {
+    // Forums often lazy-render lists. If nothing was found yet inside an allowed
+    // scope, watch DOM changes for a while instead of a single fixed retry.
+    (() => {
+        if (bar) return;
+        const site = getSiteFor(location.hostname);
+        const tour = loadTour();
+        if (!(tour && tour.urls) && !(site && inScope(site.cfg, location.href))) return;
         let settleTimer = null;
         const mo = new MutationObserver(() => {
             if (settleTimer) clearTimeout(settleTimer);
@@ -978,5 +1149,5 @@
         });
         if (document.body) mo.observe(document.body, { childList: true, subtree: true });
         setTimeout(() => mo.disconnect(), 12000);
-    }
+    })();
 })();
