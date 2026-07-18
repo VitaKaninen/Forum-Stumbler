@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.8.0
+// @version     0.9.0
 // @author      VitaKaninen
-// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site with subforum scoping, guided click-to-teach, numeric-pagination detection, and live re-scan for lazy-loaded lists.
+// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
 // @grant       GM_setValue
 // @grant       GM_getValue
@@ -25,8 +25,9 @@
     // leaks into other tabs. Position + site list are global (GM storage).
     const TOUR_KEY = 'fs_tour';           // sessionStorage: { urls, titles, source, sourceTitle, nextPage, ts }
     const RESUME_KEY = 'fs_resume';       // sessionStorage: '' | 'append' — set when we navigate to a next page as a fallback
+    const PENDING_KEY = 'fs_pending';     // sessionStorage: index we just navigated to (survives site URL rewrites)
     const POS_KEY = 'fs_barpos';          // GM: { right, bottom }
-    const SITES_KEY = 'fs_sites';         // GM: { "<host>": { all, prefixes[], pattern, sig, nextSig } }
+    const SITES_KEY = 'fs_sites';         // GM: { "<host>": { all, prefixes[], pattern, sig, nextSig, exclude[] } }
     const AUTO_CHAIN = true;              // pull the forum's "next page" of results at end of a tour
     const MIN_CLUSTER = 4;                // heuristic: need at least this many links to call it a topic list
     const MIN_TAUGHT = 2;                 // taught signature/pattern: trust smaller lists
@@ -51,10 +52,9 @@
     // taught detection overrides this list.
     const NEGATIVE = /(\/login|\/logout|\/register|\/signup|\/sign-in|\/profile|\/members?\/|\/users?\/|\/tag[s]?\/|\/categor|\/forum[s]?\/?$|[?&]page=|\/page\/\d|[?&]start=\d|\/search|\/rss|\/feed|\.(png|jpe?g|gif|svg|css|js|pdf|zip)(\?|$))/i;
 
-    // Forward-pagination vocabulary — deliberately narrow (this is not the "don't open
-    // in a new tab" list from Open-Links-in-New-Tab; things like best/hot/top/reply/
-    // "read more" are not list pagination and must not send the tour off-track).
-    // "previous"/"newer"/back-arrows are excluded so we never walk backwards.
+    // Forward-pagination vocabulary — deliberately narrow: only things that mean
+    // "the next page of this list". "previous"/"newer"/back-arrows are excluded so we
+    // never walk backwards.
     const NEXT_TEXT = /^(next|next\s*page|older|older\s*posts?|more|load\s*more|show\s*more|next\s*[»›→]|»|›|→|>>)$/i;
 
     // ---------------- Utilities ----------------
@@ -72,11 +72,25 @@
     };
     const saveTour = (t) => { try { sessionStorage.setItem(TOUR_KEY, JSON.stringify(t)); } catch (_) {} };
     const clearTourState = () => {
-        try { sessionStorage.removeItem(TOUR_KEY); sessionStorage.removeItem(RESUME_KEY); } catch (_) {}
+        try {
+            sessionStorage.removeItem(TOUR_KEY);
+            sessionStorage.removeItem(RESUME_KEY);
+            sessionStorage.removeItem(PENDING_KEY);
+        } catch (_) {}
     };
     const getResume = () => { try { return sessionStorage.getItem(RESUME_KEY) || ''; } catch (_) { return ''; } };
     const setResume = (v) => { try { sessionStorage.setItem(RESUME_KEY, v); } catch (_) {} };
     const delResume = () => { try { sessionStorage.removeItem(RESUME_KEY); } catch (_) {} };
+    const setPending = (i) => { try { sessionStorage.setItem(PENDING_KEY, String(i)); } catch (_) {} };
+    const takePending = () => {
+        try {
+            const v = sessionStorage.getItem(PENDING_KEY);
+            if (v === null) return null;
+            sessionStorage.removeItem(PENDING_KEY);
+            const n = parseInt(v, 10);
+            return Number.isInteger(n) ? n : null;
+        } catch (_) { return null; }
+    };
     const go = (url) => { location.href = url; };
 
     // One-time cleanup: tours lived in GM storage before 0.7.0.
@@ -124,7 +138,8 @@
                     prefixes: Array.isArray(cfg.prefixes) ? cfg.prefixes.filter(p => typeof p === 'string' && p) : [],
                     pattern: typeof cfg.pattern === 'string' ? cfg.pattern : null,
                     sig: typeof cfg.sig === 'string' ? cfg.sig : null,
-                    nextSig: typeof cfg.nextSig === 'string' ? cfg.nextSig : null
+                    nextSig: typeof cfg.nextSig === 'string' ? cfg.nextSig : null,
+                    exclude: Array.isArray(cfg.exclude) ? cfg.exclude.filter(p => typeof p === 'string' && p) : []
                 };
             }
             return out;
@@ -232,7 +247,7 @@
         return records;
     }
 
-    // All same-signature topic anchors on the page, deduped by URL (wordiest text wins).
+    // All same-signature topic anchors on the live page, deduped by URL (wordiest wins).
     function clusterForSig(sig) {
         const recs = collectAnchors(document, location.href, false) || [];
         const byUrl = new Map();
@@ -242,6 +257,22 @@
             if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
         }
         return Array.from(byUrl.values());
+    }
+
+    // Exception rules: regexes over pathname+search that carve wrong links (subforums,
+    // sub-subforums) out of an otherwise broad include rule.
+    function compileExcludes(list) {
+        const out = [];
+        for (const p of (list || [])) { try { out.push(new RegExp(p, 'i')); } catch (_) {} }
+        return out;
+    }
+    const excludedByRx = (urlObj, rxs) => rxs.some(rx => rx.test(urlObj.pathname + urlObj.search));
+    function filterExcluded(list, rxs) {
+        if (!list || !rxs.length) return list;
+        const out = list.filter(t => {
+            try { return !excludedByRx(new URL(t.url), rxs); } catch (_) { return true; }
+        });
+        return out.length ? out : null;
     }
 
     // Taught URL pattern (secondary): match pathname+search against the stored regex.
@@ -312,16 +343,22 @@
         return bestCluster(true) || bestCluster(false);
     }
 
-    // Detection order for an opted-in site: taught page structure → taught URL
-    // pattern → generic heuristic.
+    // Detection order for an opted-in site. A taught site uses ONLY its taught rules
+    // (structure → URL pattern, minus exceptions): on pages where they match nothing
+    // (thread pages, subforum listings) the script stays quiet instead of guessing.
+    // Un-taught sites use the heuristic.
     function detectForSite(root, base, cfg) {
-        if (cfg && cfg.sig) {
-            const r = detectTopics(root, base, cfg.sig);
-            if (r) return r;
-        }
-        if (cfg && cfg.pattern) {
-            const r = detectByPattern(root, base, cfg.pattern);
-            if (r && r.length >= MIN_TAUGHT) return r;
+        if (cfg && (cfg.sig || cfg.pattern)) {
+            const rxs = compileExcludes(cfg.exclude);
+            if (cfg.sig) {
+                const r = filterExcluded(detectTopics(root, base, cfg.sig), rxs);
+                if (r && r.length >= MIN_TAUGHT) return r;
+            }
+            if (cfg.pattern) {
+                const r = filterExcluded(detectByPattern(root, base, cfg.pattern), rxs);
+                if (r && r.length >= MIN_TAUGHT) return r;
+            }
+            return null;
         }
         return detectTopics(root, base);
     }
@@ -382,9 +419,6 @@
     }
 
     // ---------------- Teaching: pattern derivation ----------------
-    // Structure-first: learn from the anchor the user clicks (or pastes). A URL pattern
-    // is additionally derived from the structural cluster as a fallback for fetched
-    // pages / theme changes. The example link itself is never stored.
     const escRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pathSegs = (p) => p.replace(/\/+$/, '').split('/').filter(Boolean);
 
@@ -429,6 +463,10 @@
         return src;
     }
 
+    // One URL with its digits generalized — the narrowest useful exception rule.
+    const digitGen = (u) => '^' + escRx(u.pathname).replace(/\d+/g, '\\d+') +
+        (u.search ? escRx(u.search).replace(/\d+/g, '\\d+') : '');
+
     // Paste-fallback analysis: locate the pasted link on the page, learn its structure.
     function analyzeExample(exampleRaw) {
         let exUrl;
@@ -442,14 +480,7 @@
         const records = collectAnchors(document, location.href, false) || [];
         const matches = records.filter(r => r.url === ex);
         if (!matches.length) {
-            const rawPresent = Array.from(document.querySelectorAll('a[href]')).some(a => {
-                try { return norm(new URL(a.getAttribute('href'), location.href).href) === ex; } catch (_) { return false; }
-            });
-            return {
-                error: rawPresent
-                    ? 'That link is filtered out as site navigation/pagination here — paste a topic-title link instead.'
-                    : 'That link is not on this page — open the index page that lists it, then teach.'
-            };
+            return { error: 'That link is not on this page (or is filtered as navigation) — paste a topic-title link that appears here.' };
         }
         const example = matches.reduce((p, c) => (c.text.length >= p.text.length ? c : p));
         const sig = signature(example.a, true);
@@ -459,44 +490,117 @@
     }
 
     // ---------------- Teaching: guided click-to-pick ----------------
-    let captureState = null;   // { domain, step: 'topic' | 'next' }
-    let captureBanner = null;
+    // Flow: Teach (settings) wipes the site's taught rules and closes the dialog. A
+    // centered, draggable popup asks for the first thread link. That click builds the
+    // include rule; every match gets a green outline for the user to verify. Wrong
+    // links are excluded by clicking them ("Add exceptions"): each click either joins
+    // an existing exception group (the merged rule un-highlights similar links) or
+    // starts a new one. Done/Confirm saves; the next-page link is auto-detected and
+    // only asked for when that fails. Esc/Cancel exits with the rules left wiped.
+    let teach = null;        // { domain, step: 'topic'|'verify'|'except'|'next', sig, pattern, excludeGroups }
+    let teachPopup = null;
+    let hl = [];             // highlighted anchors, with their original outline to restore
     let hoverEl = null;
 
-    function showCaptureBanner() {
-        captureBanner = document.createElement('div');
-        captureBanner.id = 'fs-teach-banner';
-        captureBanner.style.cssText = 'all: initial;';
-        const root = captureBanner.attachShadow({ mode: 'open' });
+    function computeExcludePatterns() {
+        return teach.excludeGroups
+            .map(g => g.length >= 2 ? deriveFromUrls(g) : digitGen(g[0]))
+            .filter(p => typeof p === 'string' && p);
+    }
+    function includedRecords() {
+        const rxs = compileExcludes(computeExcludePatterns());
+        return clusterForSig(teach.sig).filter(r => !excludedByRx(r.urlObj, rxs));
+    }
+
+    function clearHighlights() {
+        for (const h of hl) { h.el.style.outline = h.outline; h.el.style.outlineOffset = h.offset; }
+        hl = [];
+    }
+    function applyHighlights(records) {
+        clearHighlights();
+        for (const r of records) {
+            hl.push({ el: r.a, outline: r.a.style.outline, offset: r.a.style.outlineOffset });
+            r.a.style.outline = '3px solid #a6e3a1';
+            r.a.style.outlineOffset = '1px';
+        }
+    }
+
+    function popBtn(label, bg, fg) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText = 'padding: 6px 14px; border-radius: 6px; border: none; font-size: 13px;' +
+            'font-weight: 700; cursor: pointer; background: ' + bg + '; color: ' + (fg || '#1e1e2e') + '; white-space: nowrap;';
+        return b;
+    }
+
+    function buildPopup() {
+        teachPopup = document.createElement('div');
+        teachPopup.id = 'fs-teach';
+        teachPopup.style.cssText = 'all: initial;';
+        const root = teachPopup.attachShadow({ mode: 'open' });
         const st = document.createElement('style');
         st.textContent = ':host { all: initial; } * { box-sizing: border-box; }';
         root.appendChild(st);
         const wrap = document.createElement('div');
         wrap.style.cssText = `
-            position: fixed; top: 0; left: 0; right: 0; z-index: 2147483647;
-            display: flex; align-items: center; justify-content: center; gap: 14px;
-            padding: 11px 16px; background: #1e1e2e; color: #cdd6f4;
-            font: 14px/1.35 system-ui, sans-serif; box-shadow: 0 2px 14px rgba(0,0,0,0.45);
+            position: fixed; top: 45%; left: 50%; transform: translate(-50%, -50%);
+            z-index: 2147483647; width: 400px; max-width: 92vw;
+            background: #1e1e2e; color: #cdd6f4; border: 2px solid #ffffff; border-radius: 10px;
+            padding: 14px 16px; font: 13px/1.5 system-ui, sans-serif;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.6); cursor: move;
+            display: flex; flex-direction: column; gap: 10px;
         `;
-        const msg = document.createElement('span');
-        msg.style.cssText = 'font-weight: 600; text-align: center;';
-        const cancel = document.createElement('button');
-        cancel.textContent = 'Cancel';
-        cancel.style.cssText = 'padding: 5px 14px; border: none; border-radius: 6px; background: #45475a; color: #cdd6f4; font-weight: 700; font-size: 13px; cursor: pointer; flex-shrink: 0;';
-        cancel.addEventListener('click', exitCapture);
-        wrap.append(msg, cancel);
+        // Centered so it must be dealt with, but draggable so it can be moved aside.
+        wrap.addEventListener('mousedown', (e) => {
+            if (/^(BUTTON|INPUT)$/.test(e.target.tagName)) return;
+            const r = wrap.getBoundingClientRect();
+            wrap.style.transform = 'none';
+            wrap.style.left = r.left + 'px';
+            wrap.style.top = r.top + 'px';
+            const ox = e.clientX - r.left, oy = e.clientY - r.top;
+            const onMove = (ev) => {
+                wrap.style.left = (ev.clientX - ox) + 'px';
+                wrap.style.top = (ev.clientY - oy) + 'px';
+            };
+            const onUp = () => {
+                window.removeEventListener('mousemove', onMove, true);
+                window.removeEventListener('mouseup', onUp, true);
+            };
+            window.addEventListener('mousemove', onMove, true);
+            window.addEventListener('mouseup', onUp, true);
+            e.preventDefault();
+        });
+        const msg = document.createElement('div');
+        msg.style.cssText = 'font-weight: 600;';
+        const extra = document.createElement('div');
+        extra.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+        const btns = document.createElement('div');
+        btns.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap;';
+        wrap.append(msg, extra, btns);
         root.appendChild(wrap);
-        document.documentElement.appendChild(captureBanner);
-        captureBanner._msg = msg;
+        document.documentElement.appendChild(teachPopup);
+        teachPopup._msg = msg;
+        teachPopup._extra = extra;
+        teachPopup._btns = btns;
     }
-    function setBanner(text, color) {
-        if (captureBanner && captureBanner._msg) {
-            captureBanner._msg.textContent = text;
-            captureBanner._msg.style.color = color || '#cdd6f4';
+
+    function setPopup(text, buttons, extraBuild) {
+        if (!teachPopup) return;
+        teachPopup._msg.textContent = text;
+        while (teachPopup._extra.firstChild) teachPopup._extra.removeChild(teachPopup._extra.firstChild);
+        while (teachPopup._btns.firstChild) teachPopup._btns.removeChild(teachPopup._btns.firstChild);
+        if (extraBuild) extraBuild(teachPopup._extra);
+        for (const [label, bg, fg, fn] of buttons) {
+            const b = popBtn(label, bg, fg);
+            b.addEventListener('click', fn);
+            teachPopup._btns.appendChild(b);
         }
     }
 
     function onCaptureMove(e) {
+        // Hover hint only while we're waiting for a pick (would fight the green
+        // verification outlines otherwise).
+        if (!teach || (teach.step !== 'topic' && teach.step !== 'next')) return;
         const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
         if (hoverEl && hoverEl !== a) { hoverEl.style.outline = hoverEl._fsOldOutline || ''; hoverEl = null; }
         if (a && a !== hoverEl) {
@@ -506,73 +610,187 @@
             a.style.outlineOffset = '1px';
         }
     }
-    function onCaptureKey(e) { if (e.key === 'Escape') exitCapture(); }
+    function onCaptureKey(e) { if (e.key === 'Escape') cancelCapture(); }
     function onCaptureClick(e) {
-        if (!captureState) return;
+        if (!teach) return;
         const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-        if (!a) return;                 // let non-link clicks (e.g. the banner) pass
+        if (!a) return;                 // non-link clicks (incl. our popup buttons) pass through
         e.preventDefault();
         e.stopPropagation();
         if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-        handleCapturePick(a);
+        if (teach.step === 'topic') pickTopic(a);
+        else if (teach.step === 'except') pickException(a);
+        else if (teach.step === 'next') pickNext(a);
+        // 'verify': link clicks are swallowed — use the popup buttons
     }
 
-    function enterCapture(domain) {
-        captureState = { domain, step: 'topic' };
-        showCaptureBanner();
-        setBanner('Click the first thread / topic link in the list.  (Esc to cancel)');
+    function startGuidedTeach(domain) {
+        teach = { domain, step: 'topic', sig: null, pattern: null, excludeGroups: [] };
+        buildPopup();
+        stepTopic();
         document.addEventListener('click', onCaptureClick, true);
         document.addEventListener('mouseover', onCaptureMove, true);
         document.addEventListener('keydown', onCaptureKey, true);
         try { document.body.style.cursor = 'crosshair'; } catch (_) {}
     }
+
     function exitCapture() {
         document.removeEventListener('click', onCaptureClick, true);
         document.removeEventListener('mouseover', onCaptureMove, true);
         document.removeEventListener('keydown', onCaptureKey, true);
         if (hoverEl) { hoverEl.style.outline = hoverEl._fsOldOutline || ''; hoverEl = null; }
+        clearHighlights();
         try { document.body.style.cursor = ''; } catch (_) {}
-        if (captureBanner) { captureBanner.remove(); captureBanner = null; }
-        captureState = null;
+        if (teachPopup) { teachPopup.remove(); teachPopup = null; }
+        teach = null;
+        rescan();
     }
-    function finishCaptureSoon() {
-        setTimeout(() => { exitCapture(); rescan(); }, 1600);
+    function cancelCapture() { exitCapture(); } // taught rules were wiped when Teach was clicked — they stay wiped
+
+    function stepTopic(note) {
+        teach.step = 'topic';
+        setPopup((note ? note + '  ' : '') + 'Click the link to the FIRST thread (topic) in the list on this page.',
+            [
+                ['Paste a link instead', '#45475a', '#cdd6f4', stepPaste],
+                ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
+            ]);
     }
 
-    function handleCapturePick(a) {
+    function stepPaste() {
+        setPopup('Paste a thread (topic) link that appears on this page:',
+            [
+                ['Back', '#45475a', '#cdd6f4', () => stepTopic()],
+                ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
+            ],
+            (extra) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display: flex; gap: 6px;';
+                const inp = document.createElement('input');
+                inp.type = 'text';
+                inp.placeholder = 'https://…';
+                inp.style.cssText = 'flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #45475a;' +
+                    'background: #313244; color: #cdd6f4; font-size: 13px; outline: none; cursor: text;';
+                const goBtn = popBtn('Analyze', '#89b4fa');
+                const err = document.createElement('div');
+                err.style.cssText = 'font-size: 12px; color: #f38ba8;';
+                const run = () => {
+                    const res = analyzeExample(inp.value);
+                    if (res.error) { err.textContent = res.error; return; }
+                    adoptRule(res.sig, res.pattern);
+                };
+                goBtn.addEventListener('click', run);
+                inp.addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+                row.append(inp, goBtn);
+                extra.append(row, err);
+                setTimeout(() => inp.focus(), 50);
+            });
+    }
+
+    function pickTopic(a) {
+        const sig = signature(a, true);
+        const cluster = clusterForSig(sig);
+        if (!cluster.length) {
+            stepTopic('That looks like site navigation, not a thread link — try a thread title.');
+            return;
+        }
+        adoptRule(sig, cluster.length >= 3 ? deriveFromUrls(cluster.map(r => r.urlObj)) : null);
+    }
+
+    function adoptRule(sig, pattern) {
+        teach.sig = sig;
+        teach.pattern = pattern;
+        teach.excludeGroups = [];
+        enterVerify();
+    }
+
+    function enterVerify() {
+        teach.step = 'verify';
+        const inc = includedRecords();
+        applyHighlights(inc);
+        setPopup(inc.length + ' link' + (inc.length === 1 ? ' is' : 's are') + ' highlighted in green. ' +
+            'Scroll the page and check that ONLY thread links are highlighted.',
+            [
+                ['Looks good ✓', '#a6e3a1', null, confirmSave],
+                ['Add exceptions', '#f9e2af', null, enterExcept],
+                ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
+            ]);
+    }
+
+    function enterExcept(note) {
+        teach.step = 'except';
+        const inc = includedRecords();
+        applyHighlights(inc);
+        setPopup((typeof note === 'string' ? note + '  ' : '') +
+            'Click any highlighted link that should NOT be included — similar links are removed with it. ' +
+            inc.length + ' remain highlighted.',
+            [
+                ['Done ✓', '#a6e3a1', null, confirmSave],
+                ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
+            ]);
+    }
+
+    function pickException(a) {
+        let uo;
+        try { uo = new URL(a.href, location.href); } catch (_) { return; }
+        const clickedUrl = norm(uo.href);
+        if (!includedRecords().some(r => r.url === clickedUrl)) return; // only highlighted links count
+
+        // Join an existing exception group when the merged rule stays specific (i.e.
+        // it still leaves some links highlighted); otherwise start a new group.
+        const rxsNow = compileExcludes(computeExcludePatterns());
+        let placed = false;
+        for (const g of teach.excludeGroups) {
+            const cand = deriveFromUrls(g.concat([uo]));
+            if (!cand) continue;
+            let rx;
+            try { rx = new RegExp(cand, 'i'); } catch (_) { continue; }
+            const remaining = clusterForSig(teach.sig).filter(r =>
+                !excludedByRx(r.urlObj, rxsNow) && !rx.test(r.urlObj.pathname + r.urlObj.search));
+            if (remaining.length > 0) { g.push(uo); placed = true; break; }
+        }
+        if (!placed) teach.excludeGroups.push([uo]);
+
+        const inc = includedRecords();
+        enterExcept(inc.length ? 'Removed.' : 'Removed — nothing is highlighted now; Cancel and re-teach if that went too far.');
+    }
+
+    function confirmSave() {
         const sites = getSites();
-        const cfg = sites[captureState.domain];
-        if (!cfg) { exitCapture(); return; }
-
-        if (captureState.step === 'topic') {
-            const sig = signature(a, true);
-            const cluster = clusterForSig(sig);
-            cfg.sig = sig;
-            cfg.pattern = cluster.length >= 3 ? deriveFromUrls(cluster.map(r => r.urlObj)) : null;
+        const cfg = sites[teach.domain];
+        if (cfg) {
+            cfg.sig = teach.sig;
+            cfg.pattern = teach.pattern;
+            cfg.exclude = computeExcludePatterns();
             saveSites(sites);
-            setBanner('Got it — found ' + cluster.length + ' topic' + (cluster.length === 1 ? '' : 's') +
-                ' with that structure. Looking for the “next page” link…');
-            const nxt = detectNextPage(document, location.href, {}); // auto-detect only
-            if (nxt) {
-                setBanner('✓ Learned the topic links and found the “Next” link automatically. All set!', '#a6e3a1');
-                finishCaptureSoon();
-            } else {
-                captureState.step = 'next';
-                setBanner('Couldn’t find the “next page” link. Now click the link to page 2 of this list (or Cancel if there is none).');
-            }
+        }
+        clearHighlights();
+        const nxt = detectNextPage(document, location.href, {});
+        if (nxt) {
+            finishTeach('✓ Saved. The next-page link was found automatically — all set!');
         } else {
-            cfg.nextSig = signature(a, true);
-            saveSites(sites);
-            setBanner('✓ Learned the next-page link. All set!', '#a6e3a1');
-            finishCaptureSoon();
+            teach.step = 'next';
+            setPopup('Saved the thread links. The “next page” link couldn’t be found automatically — ' +
+                'click the link to page 2 of this list (or Skip if there is none).',
+                [['Skip', '#45475a', '#cdd6f4', () => finishTeach('✓ Saved (no next-page link taught).')]]);
         }
     }
 
-    function startGuidedTeach(domain) { enterCapture(domain); }
+    function pickNext(a) {
+        const sites = getSites();
+        const cfg = sites[teach.domain];
+        if (cfg) { cfg.nextSig = signature(a, true); saveSites(sites); }
+        finishTeach('✓ Saved, including the next-page link.');
+    }
+
+    function finishTeach(msgText) {
+        teach.step = 'done';
+        setPopup(msgText, []);
+        setTimeout(() => { exitCapture(); openSettings(); }, 1400);
+    }
 
     // ---------------- UI: floating bar ----------------
     let bar;
-    let liveObserver = null;   // updates the topic count on a list page as content lazy-loads
+    let liveObserver = null;   // grows the captured list on a list page as content lazy-loads
     let waitObserver = null;   // waits for a list to render, then shows the pill
 
     function buildBar() {
@@ -689,6 +907,7 @@
             ts: Date.now()
         };
         saveTour(tour);
+        setPending(0);
         go(tour.urls[0]);
     }
 
@@ -747,6 +966,7 @@
             const newNext = detectNextPage(doc, target, cfg);
             const first = appendPage(tour, topics, newNext, target);
             if (!first) throw new Error('all duplicates');
+            setPending(tour.urls.indexOf(first));
             go(first);
         } catch (_) {
             // Fallback: navigate to the next page visibly, then auto-append on load.
@@ -759,15 +979,18 @@
     function render() {
         const tour = loadTour();
         const here = norm(location.href);
+        const pending = takePending();
 
         // A running tour owns its pages regardless of scan scope: it was started from
         // an allowed index page, lives only in this tab, and dies with it.
         if (tour && tour.urls) {
             let idx = tour.urls.indexOf(here);
-            // Forums may redirect a stored topic URL deeper — Discourse sends logged-in
-            // users to the last-read post (/t/slug/123 → /t/slug/123/4). Fall back to a
-            // prefix match with a separator so /topic/12 can't claim /topic/123.
+            // Forums may redirect a stored topic URL somewhere slightly different —
+            // Discourse appends the last-read post (/t/slug/123 → /t/slug/123/4), Reddit
+            // adds tracking. Fall back to a separator-guarded prefix match, then to the
+            // index we recorded when OUR button did the navigating.
             if (idx === -1) idx = tour.urls.findIndex(u => here.startsWith(u + '/') || here.startsWith(u + '?'));
+            if (idx === -1 && pending !== null && pending >= 0 && pending < tour.urls.length) idx = pending;
             if (idx !== -1) { renderTourBar(tour, idx); return; }
         }
 
@@ -781,6 +1004,7 @@
 
     function renderTourBar(tour, idx) {
         buildBar(); clearBar();
+        const goTopic = (i) => { setPending(i); go(tour.urls[i]); };
 
         const title = mkTitle(tour.sourceTitle || 'Forum');
         title.title = 'Back to: ' + (tour.sourceTitle || tour.source);
@@ -808,7 +1032,7 @@
             const commit = () => {
                 if (done) return; done = true;
                 const n = parseInt(input.value, 10);
-                if (!isNaN(n) && n >= 1 && n <= tour.urls.length && n !== idx + 1) go(tour.urls[n - 1]);
+                if (!isNaN(n) && n >= 1 && n <= tour.urls.length && n !== idx + 1) goTopic(n - 1);
                 else input.replaceWith(lbl); // no-op / cancel -> restore label
             };
             input.addEventListener('keydown', (e) => {
@@ -821,7 +1045,7 @@
         });
 
         back.addEventListener('click', () => {
-            if (idx > 0) go(tour.urls[idx - 1]);
+            if (idx > 0) goTopic(idx - 1);
             else if (tour.source) go(tour.source);
         });
 
@@ -830,7 +1054,7 @@
         if (isLast && canChain) { next.textContent = '⏭'; next.title = 'Pull next page → first new topic'; }
         if (isLast && !canChain) { next.style.opacity = '0.4'; next.style.cursor = 'default'; }
         next.addEventListener('click', () => {
-            if (!isLast) go(tour.urls[idx + 1]);
+            if (!isLast) goTopic(idx + 1);
             else if (canChain) pullNextPage(tour, next);
         });
 
@@ -848,7 +1072,7 @@
             if (resume === 'append' && tour && tour.urls) {
                 delResume();
                 const first = appendPage(tour, topics, nextPage, location.href);
-                if (first) { go(first); return; }
+                if (first) { setPending(tour.urls.indexOf(first)); go(first); return; }
             }
             if (resume) delResume();
             buildStartPill(site);
@@ -858,39 +1082,41 @@
         }
     }
 
-    // The capture pill: a live topic count (updates as lazy-loaded lists grow), a manual
-    // Re-scan button, Start, and Hide.
+    // The capture pill. The captured list only ever GROWS: infinite-scroll pages
+    // (Reddit) add and remove DOM as you scroll, so each re-detect may see a different
+    // window of links — accumulating keeps everything seen so far.
     function buildStartPill(site) {
         if (waitObserver) { waitObserver.disconnect(); waitObserver = null; }
         buildBar(); clearBar();
 
         const row = mkRow();
-        const start = mkBtn('📑 … — Start', 'Capture these topics and open the first');
-        const rescanBtn = mkBtn('🔄', 'Re-scan this page for more links (after scrolling)');
+        const start = mkBtn('📑 … — Start', 'Capture these topics and open the first (scroll to gather more)');
         const hide = mkBtn('✕', 'Hide');
-        const latest = { topics: [], next: null };
+        const acc = new Map();  // url -> {url, text}, insertion order = discovery order
+        let lastNext = null;
 
         const recompute = () => {
-            latest.topics = detectForSite(document, location.href, site.cfg) || [];
-            latest.next = detectNextPage(document, location.href, site.cfg);
-            const n = latest.topics.length;
+            const found = detectForSite(document, location.href, site.cfg) || [];
+            for (const t of found) if (!acc.has(t.url)) acc.set(t.url, t);
+            const nx = detectNextPage(document, location.href, site.cfg);
+            if (nx) lastNext = nx;
+            const n = acc.size;
             start.textContent = `📑 ${n} topic${n === 1 ? '' : 's'} — Start`;
-            start.style.opacity = n ? '1' : '0.5';
-            start.style.cursor = n ? 'pointer' : 'default';
         };
         recompute();
 
-        start.addEventListener('click', () => { if (latest.topics.length) startTour(latest.topics, latest.next); });
-        rescanBtn.addEventListener('click', recompute);
+        start.addEventListener('click', () => {
+            if (acc.size) startTour(Array.from(acc.values()), lastNext);
+        });
         hide.addEventListener('click', () => {
             if (liveObserver) { liveObserver.disconnect(); liveObserver = null; }
             bar.remove();
         });
 
-        row.append(start, rescanBtn, hide);
+        row.append(start, hide);
         bar.append(row);
 
-        // Live recount, event-driven (only fires when the DOM actually changes), throttled.
+        // Live growth, event-driven (only fires when the DOM actually changes), throttled.
         if (liveObserver) liveObserver.disconnect();
         let t = null;
         liveObserver = new MutationObserver(() => {
@@ -962,7 +1188,7 @@
         descMain.textContent = 'Forum Stumbler only scans the sites listed here (opt-in). By default a site is scoped to the subforum pages you add; tick "whole site" to scan everywhere on it.';
         const descTeach = document.createElement('div');
         descTeach.style.cssText = 'margin-top: 4px; color: #6c7086; font-style: italic;';
-        descTeach.textContent = 'To teach a site: open a subforum page, click Teach → "Pick on page", then click a topic link (and page 2 if asked). Nothing about the links is stored except the structure template.';
+        descTeach.textContent = 'Teach: this dialog closes and a popup guides you — click the first thread link, verify the green highlights, add exceptions for wrong links if needed. Re-teach wipes the old rules first.';
         desc.appendChild(descMain);
         desc.appendChild(descTeach);
 
@@ -996,10 +1222,6 @@
             flex: 1; min-height: 0; max-height: 45vh; padding-right: 4px;
         `;
 
-        // Teach area (shown when a site's Teach button is clicked)
-        const teachArea = document.createElement('div');
-        teachArea.style.cssText = 'display: none; flex-direction: column; gap: 6px; background: #313244; border-radius: 6px; padding: 10px;';
-
         // Status line
         const ioStatus = document.createElement('span');
         ioStatus.style.cssText = 'font-size: 12px; color: #a6e3a1; margin-left: 4px;';
@@ -1008,85 +1230,6 @@
             ioStatus.textContent = msg;
             clearTimeout(ioStatus._t);
             ioStatus._t = setTimeout(() => { ioStatus.textContent = ''; }, 4000);
-        }
-
-        function hideTeach() {
-            teachArea.style.display = 'none';
-            while (teachArea.firstChild) teachArea.removeChild(teachArea.firstChild);
-        }
-
-        function showTeach(domain) {
-            teachArea.style.display = 'flex';
-            while (teachArea.firstChild) teachArea.removeChild(teachArea.firstChild);
-
-            const lbl = document.createElement('div');
-            lbl.style.cssText = 'font-size: 12px; color: #cdd6f4; font-weight: 600;';
-            lbl.textContent = 'Teach ' + domain;
-
-            const btnRow = document.createElement('div');
-            btnRow.style.cssText = 'display: flex; gap: 6px; align-items: center;';
-            const pickBtn = smallBtn('Pick on page', '#89b4fa');
-            pickBtn.title = 'Close settings, then click a topic link on the page (guided)';
-            pickBtn.addEventListener('click', () => { host.remove(); startGuidedTeach(domain); });
-            const pasteToggle = smallBtn('Paste a link instead', '#45475a', '#cdd6f4');
-            const cancelBtn = smallBtn('Cancel', '#45475a', '#cdd6f4');
-            cancelBtn.addEventListener('click', hideTeach);
-            btnRow.append(pickBtn, pasteToggle, cancelBtn);
-
-            // Paste fallback (topic structure only)
-            const pasteWrap = document.createElement('div');
-            pasteWrap.style.cssText = 'display: none; flex-direction: column; gap: 6px;';
-            const pasteRow = document.createElement('div');
-            pasteRow.style.cssText = 'display: flex; gap: 6px;';
-            const tInput = document.createElement('input');
-            tInput.type = 'text';
-            tInput.placeholder = 'Paste a topic link from the current page…';
-            tInput.style.cssText = input.style.cssText;
-            const analyzeBtn = smallBtn('Analyze', '#89b4fa');
-            pasteRow.append(tInput, analyzeBtn);
-            const result = document.createElement('div');
-            result.style.cssText = 'font-size: 12px; line-height: 1.4; word-break: break-all;';
-            const saveRow = document.createElement('div');
-            saveRow.style.cssText = 'display: none; gap: 6px;';
-            pasteWrap.append(pasteRow, result, saveRow);
-
-            pasteToggle.addEventListener('click', () => {
-                pasteWrap.style.display = pasteWrap.style.display === 'none' ? 'flex' : 'none';
-                if (pasteWrap.style.display === 'flex') tInput.focus();
-            });
-
-            function analyze() {
-                saveRow.style.display = 'none';
-                while (saveRow.firstChild) saveRow.removeChild(saveRow.firstChild);
-                const res = analyzeExample(tInput.value);
-                if (res.error) {
-                    result.style.color = '#f38ba8';
-                    result.textContent = res.error;
-                    return;
-                }
-                result.style.color = res.count >= MIN_TAUGHT ? '#a6e3a1' : '#f9e2af';
-                result.textContent = 'Found ' + res.count + ' link' + (res.count === 1 ? '' : 's') +
-                    ' sharing this page structure.' +
-                    (res.count < MIN_TAUGHT ? ' That looks too few — try a different link, or Save anyway.' : '');
-                const saveBtn = smallBtn('Save', '#a6e3a1');
-                saveBtn.addEventListener('click', () => {
-                    const sites = getSites();
-                    if (sites[domain]) {
-                        sites[domain].sig = res.sig;
-                        sites[domain].pattern = res.pattern;
-                        saveSites(sites);
-                    }
-                    hideTeach();
-                    renderList();
-                    flashStatus('Saved topic structure for ' + domain + '.');
-                });
-                saveRow.appendChild(saveBtn);
-                saveRow.style.display = 'flex';
-            }
-            analyzeBtn.addEventListener('click', analyze);
-            tInput.addEventListener('keydown', e => { if (e.key === 'Enter') analyze(); });
-
-            teachArea.append(lbl, btnRow, pasteWrap);
         }
 
         function renderList() {
@@ -1119,10 +1262,12 @@
                 if (taught) {
                     const badge = document.createElement('span');
                     badge.style.cssText = 'font-size: 11px; color: #a6e3a1; flex-shrink: 0;';
-                    badge.textContent = cfg.nextSig ? 'taught +next' : 'taught';
+                    badge.textContent = 'taught' + (cfg.nextSig ? ' +next' : '') +
+                        (cfg.exclude.length ? ' +' + cfg.exclude.length + ' excl' : '');
                     badge.title = 'Structure: ' + (cfg.sig || '(none)') +
                         (cfg.pattern ? '\nURL pattern: ' + cfg.pattern : '') +
-                        (cfg.nextSig ? '\nNext-page: ' + cfg.nextSig : '');
+                        (cfg.nextSig ? '\nNext-page: ' + cfg.nextSig : '') +
+                        (cfg.exclude.length ? '\nExceptions:\n' + cfg.exclude.join('\n') : '');
                     row.appendChild(badge);
                 }
 
@@ -1144,28 +1289,26 @@
                 });
                 row.appendChild(allLbl);
 
+                // Teach / Re-teach: wipes the stored rules immediately (Cancel/Esc in
+                // the guided flow leaves them wiped), closes settings, starts guiding.
                 const teachBtn = smallBtn(taught ? 'Re-teach' : 'Teach', '#89b4fa');
                 if (onSite) {
-                    teachBtn.title = 'Learn the topic-link structure from this page';
-                    teachBtn.addEventListener('click', () => showTeach(d));
+                    teachBtn.title = 'Erase the taught rules and learn fresh from this page';
+                    teachBtn.addEventListener('click', () => {
+                        const s = getSites();
+                        if (s[d]) {
+                            s[d].sig = null; s[d].pattern = null; s[d].nextSig = null; s[d].exclude = [];
+                            saveSites(s);
+                        }
+                        host.remove();
+                        startGuidedTeach(d);
+                    });
                 } else {
                     teachBtn.style.opacity = '0.4';
                     teachBtn.style.cursor = 'default';
                     teachBtn.title = 'Open a subforum page on ' + d + ' to teach it';
                 }
                 row.appendChild(teachBtn);
-
-                if (taught || cfg.nextSig) {
-                    const forgetBtn = smallBtn('Forget', '#f9e2af');
-                    forgetBtn.title = 'Forget the taught structure (falls back to auto-detection)';
-                    forgetBtn.addEventListener('click', () => {
-                        const s = getSites();
-                        if (s[d]) { s[d].sig = null; s[d].pattern = null; s[d].nextSig = null; saveSites(s); }
-                        renderList();
-                        flashStatus('Forgot taught structure for ' + d + '.');
-                    });
-                    row.appendChild(forgetBtn);
-                }
 
                 const removeBtn = document.createElement('button');
                 removeBtn.textContent = '✕';
@@ -1258,7 +1401,7 @@
                 const pf = suggestPrefix(location.href);
                 if (pf) prefixes.push(pf);
             }
-            sites[d] = { all: false, prefixes, pattern: null, sig: null, nextSig: null };
+            sites[d] = { all: false, prefixes, pattern: null, sig: null, nextSig: null, exclude: [] };
             saveSites(sites);
             renderList();
             input.value = '';
@@ -1324,7 +1467,8 @@
                             prefixes: (cfg && Array.isArray(cfg.prefixes)) ? cfg.prefixes.filter(p => typeof p === 'string' && p) : [],
                             pattern: (cfg && typeof cfg.pattern === 'string') ? cfg.pattern : null,
                             sig: (cfg && typeof cfg.sig === 'string') ? cfg.sig : null,
-                            nextSig: (cfg && typeof cfg.nextSig === 'string') ? cfg.nextSig : null
+                            nextSig: (cfg && typeof cfg.nextSig === 'string') ? cfg.nextSig : null,
+                            exclude: (cfg && Array.isArray(cfg.exclude)) ? cfg.exclude.filter(p => typeof p === 'string' && p) : []
                         };
                         n++;
                     }
@@ -1349,7 +1493,7 @@
         overlay.addEventListener('click', e => { if (e.target === overlay) closeAll(); });
 
         renderList();
-        panel.append(title, desc, addRow, list, teachArea, ioRow, closeBtn);
+        panel.append(title, desc, addRow, list, ioRow, closeBtn);
         overlay.appendChild(panel);
         root.appendChild(overlay);
         document.documentElement.appendChild(host);
