@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.1.0
+// @version     0.2.0
 // @author      VitaKaninen
-// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Auto-chains to the next page.
+// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Shows the source forum name and pulls the next page of results in the background.
 // @match       *://*/*
 // @grant       GM_setValue
 // @grant       GM_getValue
@@ -19,10 +19,10 @@
     if (window !== window.top) return; // top frame only
 
     // ---------------- Config ----------------
-    const TOUR_KEY = 'fs_tour';           // { urls, titles, source, nextPage, ts }
+    const TOUR_KEY = 'fs_tour';           // { urls, titles, source, sourceTitle, nextPage, ts }
     const POS_KEY = 'fs_barpos';          // { right, bottom }
-    const RESUME_KEY = 'fs_resume';       // true = auto-capture + jump to first topic on next load
-    const AUTO_CHAIN = true;              // follow the forum's "next page" link at end of a tour
+    const RESUME_KEY = 'fs_resume';       // '' | 'append' — set when we navigate to a next page as a fallback
+    const AUTO_CHAIN = true;              // pull the forum's "next page" of results at end of a tour
     const MIN_CLUSTER = 4;                // need at least this many links to call it a topic list
     const MIN_TITLE_LEN = 12;             // topic titles tend to be wordy
 
@@ -45,12 +45,12 @@
     const NEGATIVE = /(\/login|\/logout|\/register|\/signup|\/sign-in|\/profile|\/members?\/|\/users?\/|\/tag[s]?\/|\/categor|\/forum[s]?\/?$|[?&]page=|\/page\/\d|[?&]start=\d|\/search|\/rss|\/feed|\.(png|jpe?g|gif|svg|css|js|pdf|zip)(\?|$))/i;
 
     // ---------------- Utilities ----------------
-    const norm = (u) => {
+    // Normalise a URL for comparison/storage: absolute, no hash, no trailing slash.
+    const norm = (u, base) => {
         try {
-            const x = new URL(u, location.href);
+            const x = new URL(u, base || location.href);
             x.hash = '';
-            let s = x.href;
-            return s.replace(/\/$/, '');
+            return x.href.replace(/\/$/, '');
         } catch (_) { return u; }
     };
 
@@ -58,6 +58,7 @@
         try { return JSON.parse(GM_getValue(TOUR_KEY, 'null')); } catch (_) { return null; }
     };
     const saveTour = (t) => GM_setValue(TOUR_KEY, JSON.stringify(t));
+    const go = (url) => { location.href = url; };
 
     function inChrome(el) {
         // true if inside site chrome (nav/header/footer/aside) — not main content
@@ -79,18 +80,23 @@
     }
 
     // ---------------- Detection ----------------
-    function detectTopics() {
-        const here = norm(location.href);
-        const anchors = Array.from(document.querySelectorAll('a[href]'));
+    // Works on either the live document or a fetched-and-parsed one; `base` is that
+    // document's own URL so relative hrefs resolve correctly.
+    function detectTopics(root, base) {
+        base = base || location.href;
+        let baseOrigin;
+        try { baseOrigin = new URL(base).origin; } catch (_) { return null; }
+        const here = norm(base, base);
+        const anchors = Array.from(root.querySelectorAll('a[href]'));
         const groups = new Map();
 
         for (const a of anchors) {
             const raw = a.getAttribute('href');
             if (!raw || raw.startsWith('#') || /^(javascript|mailto|tel):/i.test(raw)) continue;
             let url;
-            try { url = new URL(a.href); } catch (_) { continue; }
-            if (url.origin !== location.origin) continue;         // same-site topics only
-            const nurl = norm(a.href);
+            try { url = new URL(raw, base); } catch (_) { continue; }
+            if (url.origin !== baseOrigin) continue;              // same-site topics only
+            const nurl = norm(url.href, base);
             if (nurl === here) continue;                          // not the current page
             if (NEGATIVE.test(nurl)) continue;
             if (inChrome(a)) continue;
@@ -119,19 +125,27 @@
         return best; // array of {url, text} in document order, or null
     }
 
-    function detectNextPage() {
+    function detectNextPage(root, base) {
+        base = base || location.href;
+        let baseOrigin;
+        try { baseOrigin = new URL(base).origin; } catch (_) { baseOrigin = location.origin; }
         // rel=next first
-        let el = document.querySelector('a[rel~="next"], link[rel~="next"]');
-        if (el && el.href) return norm(el.href);
+        let el = root.querySelector('a[rel~="next"], link[rel~="next"]');
+        if (el) {
+            const raw = el.getAttribute('href');
+            if (raw) { try { return norm(new URL(raw, base).href, base); } catch (_) {} }
+        }
         // then anchors whose text/aria look like "next"
-        const rx = /^(next|older|more|›|»|>>|→)$/i;
-        const cands = Array.from(document.querySelectorAll('a[href]'));
-        for (const a of cands) {
+        const rx = /^(next|older|more|›|»|>>|→|next\s*page|next\s*»?)$/i;
+        for (const a of root.querySelectorAll('a[href]')) {
             const t = (a.textContent || '').trim();
             const al = (a.getAttribute('aria-label') || '').trim();
             if ((rx.test(t) || /next|older/i.test(al)) && !inChrome(a)) {
+                const raw = a.getAttribute('href');
+                if (!raw || raw.startsWith('#')) continue;
                 try {
-                    if (new URL(a.href).origin === location.origin) return norm(a.href);
+                    const u = new URL(raw, base);
+                    if (u.origin === baseOrigin) return norm(u.href, base);
                 } catch (_) {}
             }
         }
@@ -145,7 +159,7 @@
         bar = document.createElement('div');
         Object.assign(bar.style, {
             position: 'fixed', zIndex: 2147483647, right: '16px', bottom: '16px',
-            display: 'flex', alignItems: 'center', gap: '6px',
+            display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '4px',
             padding: '6px 8px', borderRadius: '10px',
             background: 'rgba(28,28,32,0.92)', color: '#fff',
             font: '13px/1.2 system-ui, sans-serif',
@@ -159,7 +173,7 @@
         return bar;
     }
 
-    function mkBtn(label, title, onClick) {
+    function mkBtn(label, title) {
         const b = document.createElement('button');
         b.textContent = label;
         b.title = title || '';
@@ -170,7 +184,6 @@
         });
         b.addEventListener('mouseenter', () => b.style.background = 'rgba(255,255,255,0.26)');
         b.addEventListener('mouseleave', () => b.style.background = 'rgba(255,255,255,0.14)');
-        b.addEventListener('click', (e) => { e.preventDefault(); onClick(); });
         return b;
     }
 
@@ -180,6 +193,23 @@
         s.style.padding = '0 4px';
         s.style.whiteSpace = 'nowrap';
         return s;
+    }
+
+    function mkTitle(text) {
+        const s = document.createElement('div');
+        s.textContent = text;
+        Object.assign(s.style, {
+            maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap', textAlign: 'center', fontSize: '11px',
+            opacity: '0.75', cursor: 'pointer'
+        });
+        return s;
+    }
+
+    function mkRow() {
+        const r = document.createElement('div');
+        Object.assign(r.style, { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' });
+        return r;
     }
 
     function makeDraggable(el) {
@@ -210,30 +240,79 @@
 
     function clearBar() { if (bar) bar.textContent = ''; }
 
+    // ---------------- Tour lifecycle ----------------
     function startTour(topics, nextPage) {
         const tour = {
             urls: topics.map(t => t.url),
             titles: topics.map(t => t.text),
             source: norm(location.href),
+            sourceTitle: (document.title || location.hostname).trim(),
             nextPage: nextPage || null,
             ts: Date.now()
         };
         saveTour(tour);
-        location.href = tour.urls[0];
+        go(tour.urls[0]);
     }
 
-    function go(url) { location.href = url; }
+    // Append a freshly-detected page of topics onto the running tour (dedup against
+    // what we already have). Returns the first newly-added URL, or null.
+    function appendPage(tour, topics, newNext, newNextBase) {
+        const existing = new Set(tour.urls);
+        const addUrls = [], addTitles = [];
+        for (const t of topics) {
+            if (!existing.has(t.url)) { existing.add(t.url); addUrls.push(t.url); addTitles.push(t.text); }
+        }
+        if (!addUrls.length) return null;
+        tour.urls = tour.urls.concat(addUrls);
+        tour.titles = tour.titles.concat(addTitles);
+        const nn = newNext ? norm(newNext, newNextBase) : null;
+        tour.nextPage = (nn && !tour.urls.includes(nn) && nn !== tour.nextPage) ? nn : null;
+        saveTour(tour);
+        return addUrls[0];
+    }
 
+    // End-of-tour: fetch the next results page in the background, parse it, append its
+    // topics, and jump to the first new one. Falls back to a visible navigation if the
+    // page can't be fetched/parsed (e.g. JS-rendered lists).
+    async function pullNextPage(tour, nextBtn) {
+        if (!tour.nextPage) return;
+        const target = tour.nextPage;
+        if (nextBtn) { nextBtn.textContent = '…'; nextBtn.title = 'Loading next page…'; }
+        try {
+            const resp = await fetch(target, { credentials: 'same-origin' });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const html = await resp.text();
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const topics = detectTopics(doc, target);
+            if (!topics || topics.length < MIN_CLUSTER) throw new Error('no topics in fetched page');
+            const newNext = detectNextPage(doc, target);
+            const first = appendPage(tour, topics, newNext, target);
+            if (!first) throw new Error('all duplicates');
+            go(first);
+        } catch (_) {
+            // Fallback: navigate to the next page visibly, then auto-append on load.
+            GM_setValue(RESUME_KEY, 'append');
+            go(target);
+        }
+    }
+
+    // ---------------- Render ----------------
     function render() {
         const tour = loadTour();
         const here = norm(location.href);
 
-        // Are we currently on a topic that belongs to the active tour?
+        // On a topic that belongs to the active tour?
         if (tour && tour.urls) {
             const idx = tour.urls.indexOf(here);
             if (idx !== -1) {
                 buildBar(); clearBar();
-                const back = mkBtn('◀', 'Previous topic');
+
+                const title = mkTitle(tour.sourceTitle || 'Forum');
+                title.title = 'Back to: ' + (tour.sourceTitle || tour.source);
+                if (tour.source) title.addEventListener('click', () => go(tour.source));
+
+                const row = mkRow();
+                const back = mkBtn('◀', idx === 0 ? 'Back to index' : 'Previous topic');
                 const next = mkBtn('▶', 'Next topic');
                 const lbl = mkLabel(`${idx + 1} / ${tour.urls.length}`);
 
@@ -241,50 +320,55 @@
                     if (idx > 0) go(tour.urls[idx - 1]);
                     else if (tour.source) go(tour.source);
                 });
+
+                const isLast = idx === tour.urls.length - 1;
+                const canChain = AUTO_CHAIN && tour.nextPage;
+                if (isLast && canChain) { next.textContent = '⏭'; next.title = 'Pull next page → first new topic'; }
+                if (isLast && !canChain) { next.style.opacity = '0.4'; next.style.cursor = 'default'; }
                 next.addEventListener('click', () => {
-                    if (idx < tour.urls.length - 1) go(tour.urls[idx + 1]);
-                    else if (AUTO_CHAIN && tour.nextPage) { GM_setValue(RESUME_KEY, '1'); go(tour.nextPage); }
+                    if (!isLast) go(tour.urls[idx + 1]);
+                    else if (canChain) pullNextPage(tour, next);
                 });
-                if (idx === 0) back.title = 'Back to index';
-                if (idx === tour.urls.length - 1 && !(AUTO_CHAIN && tour.nextPage)) {
-                    next.style.opacity = '0.4'; next.style.cursor = 'default';
-                } else if (idx === tour.urls.length - 1) {
-                    next.textContent = '⏭'; next.title = 'Next page → first topic';
-                }
-                bar.append(back, lbl, next);
+
+                row.append(back, lbl, next);
+                bar.append(title, row);
                 return;
             }
         }
 
-        // Not in a tour here — is this a list page? Detect + offer to start.
-        const topics = detectTopics();
+        // Not in a tour here — is this a list page?
+        const topics = detectTopics(document, location.href);
         const resume = GM_getValue(RESUME_KEY, '');
 
         if (topics && topics.length >= MIN_CLUSTER) {
-            const nextPage = detectNextPage();
-            if (resume) {
-                // arrived from a previous page's "next"; auto-capture and jump in
+            const nextPage = detectNextPage(document, location.href);
+
+            // Arrived here as the fallback continuation of a running tour: append + jump in.
+            if (resume === 'append' && tour && tour.urls) {
                 GM_deleteValue(RESUME_KEY);
-                startTour(topics, nextPage);
-                return;
+                const first = appendPage(tour, topics, nextPage, location.href);
+                if (first) { go(first); return; }
             }
+            if (resume) GM_deleteValue(RESUME_KEY);
+
             buildBar(); clearBar();
+            const row = mkRow();
             const start = mkBtn(`📑 ${topics.length} topics — Start`, 'Capture these topics and open the first');
             start.addEventListener('click', () => startTour(topics, nextPage));
             const hide = mkBtn('✕', 'Hide');
             hide.addEventListener('click', () => bar.remove());
-            bar.append(start, hide);
+            row.append(start, hide);
+            bar.append(row);
         } else if (resume) {
-            // resume flag set but no list detected here — clear it to avoid confusion
-            GM_deleteValue(RESUME_KEY);
+            GM_deleteValue(RESUME_KEY); // stale flag, nothing to continue here
         }
     }
 
     // ---------------- Menu commands ----------------
-    GM_registerMenuCommand('Forum Stumbler: re-scan this page', () => { if (bar) bar.remove(); bar = null; render(); });
+    GM_registerMenuCommand('Forum Stumbler: re-scan this page', () => { if (bar) { bar.remove(); bar = null; } render(); });
     GM_registerMenuCommand('Forum Stumbler: clear saved tour', () => {
         GM_deleteValue(TOUR_KEY); GM_deleteValue(RESUME_KEY);
-        if (bar) bar.remove(); bar = null;
+        if (bar) { bar.remove(); bar = null; }
     });
 
     // ---------------- Boot ----------------
