@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.9.0
+// @version     0.10.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
@@ -490,14 +490,17 @@
     }
 
     // ---------------- Teaching: guided click-to-pick ----------------
-    // Flow: Teach (settings) wipes the site's taught rules and closes the dialog. A
-    // centered, draggable popup asks for the first thread link. That click builds the
-    // include rule; every match gets a green outline for the user to verify. Wrong
-    // links are excluded by clicking them ("Add exceptions"): each click either joins
-    // an existing exception group (the merged rule un-highlights similar links) or
-    // starts a new one. Done/Confirm saves; the next-page link is auto-detected and
-    // only asked for when that fails. Esc/Cancel exits with the rules left wiped.
-    let teach = null;        // { domain, step: 'topic'|'verify'|'except'|'next', sig, pattern, excludeGroups }
+    // Two guided flows, each a centered draggable popup with click capture:
+    //  - Teach threads ('full'): wipes the site's taught rules, asks for the first
+    //    thread link, highlights every match in green for verification, then saves.
+    //    The next-page link is auto-detected and only asked for when that fails.
+    //    Esc/Cancel exits with the rules left wiped.
+    //  - Exceptions ('except'): runs on any page, no wipe. Highlights what the saved
+    //    rule catches there; each click on a wrong link either joins an existing
+    //    exception group (the merged rule un-highlights similar links) or starts a
+    //    new one. Save APPENDS the new rules to the stored ones — earlier exceptions
+    //    (possibly taught on other pages) survive. Esc/Cancel changes nothing.
+    let teach = null;        // { domain, mode: 'full'|'except', step: 'topic'|'verify'|'except'|'next', sig, pattern, baseExcludes, excludeGroups }
     let teachPopup = null;
     let hl = [];             // highlighted anchors, with their original outline to restore
     let hoverEl = null;
@@ -507,9 +510,30 @@
             .map(g => g.length >= 2 ? deriveFromUrls(g) : digitGen(g[0]))
             .filter(p => typeof p === 'string' && p);
     }
+    // Anchors on the live page matched by the rule being taught/edited: structure
+    // first, stored URL pattern as fallback (mirrors detectForSite, but keeps the
+    // anchor elements so they can be highlighted).
+    function matchedRecords() {
+        let recs = teach.sig ? clusterForSig(teach.sig) : [];
+        if (!recs.length && teach.pattern) {
+            let rx;
+            try { rx = new RegExp(teach.pattern, 'i'); } catch (_) { rx = null; }
+            if (rx) {
+                const all = collectAnchors(document, location.href, false) || [];
+                const byUrl = new Map();
+                for (const r of all) {
+                    if (!rx.test(r.urlObj.pathname + r.urlObj.search)) continue;
+                    const prev = byUrl.get(r.url);
+                    if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
+                }
+                recs = Array.from(byUrl.values());
+            }
+        }
+        return recs;
+    }
     function includedRecords() {
-        const rxs = compileExcludes(computeExcludePatterns());
-        return clusterForSig(teach.sig).filter(r => !excludedByRx(r.urlObj, rxs));
+        const rxs = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
+        return matchedRecords().filter(r => !excludedByRx(r.urlObj, rxs));
     }
 
     function clearHighlights() {
@@ -624,14 +648,31 @@
         // 'verify': link clicks are swallowed — use the popup buttons
     }
 
-    function startGuidedTeach(domain) {
-        teach = { domain, step: 'topic', sig: null, pattern: null, excludeGroups: [] };
+    function enterCaptureMode() {
         buildPopup();
-        stepTopic();
         document.addEventListener('click', onCaptureClick, true);
         document.addEventListener('mouseover', onCaptureMove, true);
         document.addEventListener('keydown', onCaptureKey, true);
         try { document.body.style.cursor = 'crosshair'; } catch (_) {}
+    }
+
+    function startGuidedTeach(domain) {
+        teach = { domain, mode: 'full', step: 'topic', sig: null, pattern: null, baseExcludes: [], excludeGroups: [] };
+        enterCaptureMode();
+        stepTopic();
+    }
+
+    // Exceptions-only flow: edits the stored rule additively, so nothing is wiped and
+    // Cancel is a true no-op.
+    function startExceptionTeach(domain) {
+        const cfg = getSites()[domain] || {};
+        teach = {
+            domain, mode: 'except', step: 'except',
+            sig: cfg.sig || null, pattern: cfg.pattern || null,
+            baseExcludes: (cfg.exclude || []).slice(), excludeGroups: []
+        };
+        enterCaptureMode();
+        enterExcept();
     }
 
     function exitCapture() {
@@ -708,10 +749,10 @@
         const inc = includedRecords();
         applyHighlights(inc);
         setPopup(inc.length + ' link' + (inc.length === 1 ? ' is' : 's are') + ' highlighted in green. ' +
-            'Scroll the page and check that ONLY thread links are highlighted.',
+            'Scroll the page and check that ONLY thread links are highlighted. ' +
+            '(Wrong links can be excluded afterwards with the site’s Exceptions button.)',
             [
                 ['Looks good ✓', '#a6e3a1', null, confirmSave],
-                ['Add exceptions', '#f9e2af', null, enterExcept],
                 ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
             ]);
     }
@@ -720,11 +761,18 @@
         teach.step = 'except';
         const inc = includedRecords();
         applyHighlights(inc);
+        if (!inc.length && !teach.excludeGroups.length) {
+            setPopup('The taught rule doesn’t match any links on this page (or existing exceptions already remove them all). ' +
+                'Open a page where the wrong links appear, then try again.',
+                [['Close', '#45475a', '#cdd6f4', cancelCapture]]);
+            return;
+        }
         setPopup((typeof note === 'string' ? note + '  ' : '') +
-            'Click any highlighted link that should NOT be included — similar links are removed with it. ' +
-            inc.length + ' remain highlighted.',
+            'These ' + inc.length + ' highlighted links are what the rule currently catches on this page. ' +
+            'Click any that should NOT be included — similar links are removed with it. ' +
+            'New exceptions are ADDED to the existing ones.',
             [
-                ['Done ✓', '#a6e3a1', null, confirmSave],
+                ['Save ✓', '#a6e3a1', null, saveExceptions],
                 ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
             ]);
     }
@@ -737,14 +785,14 @@
 
         // Join an existing exception group when the merged rule stays specific (i.e.
         // it still leaves some links highlighted); otherwise start a new group.
-        const rxsNow = compileExcludes(computeExcludePatterns());
+        const rxsNow = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
         let placed = false;
         for (const g of teach.excludeGroups) {
             const cand = deriveFromUrls(g.concat([uo]));
             if (!cand) continue;
             let rx;
             try { rx = new RegExp(cand, 'i'); } catch (_) { continue; }
-            const remaining = clusterForSig(teach.sig).filter(r =>
+            const remaining = matchedRecords().filter(r =>
                 !excludedByRx(r.urlObj, rxsNow) && !rx.test(r.urlObj.pathname + r.urlObj.search));
             if (remaining.length > 0) { g.push(uo); placed = true; break; }
         }
@@ -773,6 +821,22 @@
                 'click the link to page 2 of this list (or Skip if there is none).',
                 [['Skip', '#45475a', '#cdd6f4', () => finishTeach('✓ Saved (no next-page link taught).')]]);
         }
+    }
+
+    // Exceptions flow: append the new rules to the stored ones — never overwrite.
+    function saveExceptions() {
+        const added = computeExcludePatterns();
+        if (added.length) {
+            const sites = getSites();
+            const cfg = sites[teach.domain];
+            if (cfg) {
+                cfg.exclude = teach.baseExcludes.concat(added.filter(p => !teach.baseExcludes.includes(p)));
+                saveSites(sites);
+            }
+        }
+        finishTeach(added.length
+            ? '✓ Added ' + added.length + ' exception rule' + (added.length === 1 ? '' : 's') + '.'
+            : 'No exceptions were added — nothing changed.');
     }
 
     function pickNext(a) {
@@ -1188,7 +1252,7 @@
         descMain.textContent = 'Forum Stumbler only scans the sites listed here (opt-in). By default a site is scoped to the subforum pages you add; tick "whole site" to scan everywhere on it.';
         const descTeach = document.createElement('div');
         descTeach.style.cssText = 'margin-top: 4px; color: #6c7086; font-style: italic;';
-        descTeach.textContent = 'Teach: this dialog closes and a popup guides you — click the first thread link, verify the green highlights, add exceptions for wrong links if needed. Re-teach wipes the old rules first.';
+        descTeach.textContent = 'Teach threads: a popup guides you — click the first thread link, then verify the green highlights (re-teaching wipes the old rules, exceptions included). Exceptions: on any page, highlights what the rule catches so you can click wrong links to exclude them — new exceptions are added to the existing ones.';
         desc.appendChild(descMain);
         desc.appendChild(descTeach);
 
@@ -1253,7 +1317,7 @@
                 wrap.style.cssText = 'display: flex; flex-direction: column; gap: 5px; background: #313244; border-radius: 6px; padding: 7px 10px;';
 
                 const row = document.createElement('div');
-                row.style.cssText = 'display: flex; align-items: center; gap: 6px;';
+                row.style.cssText = 'display: flex; align-items: center; gap: 6px; flex-wrap: wrap;';
                 const label = document.createElement('span');
                 label.style.cssText = 'font-size: 13px; word-break: break-all; flex: 1; font-weight: 600;';
                 label.textContent = d;
@@ -1289,11 +1353,11 @@
                 });
                 row.appendChild(allLbl);
 
-                // Teach / Re-teach: wipes the stored rules immediately (Cancel/Esc in
+                // Teach threads: wipes the stored rules immediately (Cancel/Esc in
                 // the guided flow leaves them wiped), closes settings, starts guiding.
-                const teachBtn = smallBtn(taught ? 'Re-teach' : 'Teach', '#89b4fa');
+                const teachBtn = smallBtn(taught ? 'Re-teach threads' : 'Teach threads', '#89b4fa');
                 if (onSite) {
-                    teachBtn.title = 'Erase the taught rules and learn fresh from this page';
+                    teachBtn.title = 'Erase the taught rules (exceptions included) and learn the thread links fresh from this page';
                     teachBtn.addEventListener('click', () => {
                         const s = getSites();
                         if (s[d]) {
@@ -1309,6 +1373,22 @@
                     teachBtn.title = 'Open a subforum page on ' + d + ' to teach it';
                 }
                 row.appendChild(teachBtn);
+
+                // Exceptions: additive — highlights what the rule catches on the
+                // current page, clicks exclude, Save appends to the stored exceptions.
+                const excBtn = smallBtn('Exceptions', '#f9e2af');
+                if (taught && onSite) {
+                    excBtn.title = 'Highlight what the taught rule catches on this page and click wrong links to exclude them — added on top of the existing exceptions';
+                    excBtn.addEventListener('click', () => {
+                        host.remove();
+                        startExceptionTeach(d);
+                    });
+                } else {
+                    excBtn.style.opacity = '0.4';
+                    excBtn.style.cursor = 'default';
+                    excBtn.title = taught ? 'Open a page on ' + d + ' to add exceptions' : 'Teach the thread links first';
+                }
+                row.appendChild(excBtn);
 
                 const removeBtn = document.createElement('button');
                 removeBtn.textContent = '✕';
