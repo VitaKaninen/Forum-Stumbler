@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.4.0
+// @version     0.5.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Shows the source forum name and pulls the next page of results in the background.
 // @match       *://*/*
@@ -167,17 +167,25 @@
         Object.assign(bar.style, {
             position: 'fixed', zIndex: 2147483647, right: '0px', bottom: '0px',
             display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '4px',
-            padding: '6px 8px', borderRadius: '10px 0 0 0',
+            padding: '6px 8px', borderRadius: '10px',
             background: 'rgba(28,28,32,0.92)', color: '#fff',
             font: '13px/1.2 system-ui, sans-serif',
             boxShadow: '0 4px 14px rgba(0,0,0,0.35)', userSelect: 'none',
             backdropFilter: 'blur(4px)'
         });
-        // Restore a dragged position, clamped so a narrower page can't hide it.
+        // Restore a dragged position. Offsets are measured against the content area
+        // (documentElement.clientWidth/Height, which exclude the scrollbar) so "flush in
+        // the corner" is a true 0. Snap near-edge values to 0 and clamp so a narrower page
+        // can't hide it.
+        const de = document.documentElement;
         const pos = (() => { try { return JSON.parse(GM_getValue(POS_KEY, 'null')); } catch (_) { return null; } })();
         if (pos) {
-            bar.style.right = Math.min(Math.max(0, pos.right | 0), Math.max(0, window.innerWidth - 40)) + 'px';
-            bar.style.bottom = Math.min(Math.max(0, pos.bottom | 0), Math.max(0, window.innerHeight - 30)) + 'px';
+            let r = Math.min(Math.max(0, pos.right | 0), Math.max(0, de.clientWidth - 40));
+            let b = Math.min(Math.max(0, pos.bottom | 0), Math.max(0, de.clientHeight - 30));
+            if (r < 12) r = 0;
+            if (b < 12) b = 0;
+            bar.style.right = r + 'px';
+            bar.style.bottom = b + 'px';
         }
         document.body.appendChild(bar);
         makeDraggable(bar);
@@ -224,13 +232,17 @@
     }
 
     function makeDraggable(el) {
+        // Measure against the content area (clientWidth/Height exclude the scrollbar) so
+        // the coordinate space matches getBoundingClientRect and CSS right/bottom.
+        const vw = () => document.documentElement.clientWidth;
+        const vh = () => document.documentElement.clientHeight;
         let sx, sy, sr, sb, drag = false;
         el.addEventListener('mousedown', (e) => {
-            if (e.target.tagName === 'BUTTON') return;
+            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
             drag = true;
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect();
-            sr = window.innerWidth - r.right; sb = window.innerHeight - r.bottom;
+            sr = vw() - r.right; sb = vh() - r.bottom;
             e.preventDefault();
         });
         window.addEventListener('mousemove', (e) => {
@@ -242,10 +254,11 @@
         window.addEventListener('mouseup', () => {
             if (!drag) return; drag = false;
             const r = el.getBoundingClientRect();
-            GM_setValue(POS_KEY, JSON.stringify({
-                right: Math.round(window.innerWidth - r.right),
-                bottom: Math.round(window.innerHeight - r.bottom)
-            }));
+            let right = Math.round(vw() - r.right);
+            let bottom = Math.round(vh() - r.bottom);
+            if (right < 12) right = 0;   // snap flush to the corner
+            if (bottom < 12) bottom = 0;
+            GM_setValue(POS_KEY, JSON.stringify({ right, bottom }));
         });
     }
 
