@@ -1,0 +1,294 @@
+// ==UserScript==
+// @name        Forum Stumbler
+// @namespace   https://github.com/VitaKaninen
+// @version     0.1.0
+// @author      VitaKaninen
+// @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Auto-chains to the next page.
+// @match       *://*/*
+// @grant       GM_setValue
+// @grant       GM_getValue
+// @grant       GM_deleteValue
+// @grant       GM_registerMenuCommand
+// @run-at      document-idle
+// @downloadURL  https://raw.githubusercontent.com/VitaKaninen/Forum-Stumbler/main/Forum-Stumbler.user.js
+// @updateURL    https://raw.githubusercontent.com/VitaKaninen/Forum-Stumbler/main/Forum-Stumbler.user.js
+// ==/UserScript==
+
+(function () {
+    'use strict';
+    if (window !== window.top) return; // top frame only
+
+    // ---------------- Config ----------------
+    const TOUR_KEY = 'fs_tour';           // { urls, titles, source, nextPage, ts }
+    const POS_KEY = 'fs_barpos';          // { right, bottom }
+    const RESUME_KEY = 'fs_resume';       // true = auto-capture + jump to first topic on next load
+    const AUTO_CHAIN = true;              // follow the forum's "next page" link at end of a tour
+    const MIN_CLUSTER = 4;                // need at least this many links to call it a topic list
+    const MIN_TITLE_LEN = 12;             // topic titles tend to be wordy
+
+    // Known forum topic-URL patterns (a match makes a cluster near-certain).
+    const TOPIC_PATTERNS = [
+        /\/t\/[^/]+\/\d+/i,        // Discourse
+        /\/threads\//i,             // XenForo / vBulletin 4+
+        /showthread\.php/i,         // vBulletin
+        /viewtopic\.php/i,          // phpBB
+        /[?&]topic=\d/i,            // SMF
+        /\/topic\/\d/i,             // Invision (IPB)
+        /\/comments\//i,            // Reddit
+        /\/post\/\d/i,              // Lemmy
+        /item\?id=\d/i,             // Hacker News
+        /\/discussion\//i,          // Vanilla
+        /\/thread[s]?[-/]/i         // generic
+    ];
+
+    // Hrefs that are clearly NOT topics (nav/pagination/account/etc).
+    const NEGATIVE = /(\/login|\/logout|\/register|\/signup|\/sign-in|\/profile|\/members?\/|\/users?\/|\/tag[s]?\/|\/categor|\/forum[s]?\/?$|[?&]page=|\/page\/\d|[?&]start=\d|\/search|\/rss|\/feed|\.(png|jpe?g|gif|svg|css|js|pdf|zip)(\?|$))/i;
+
+    // ---------------- Utilities ----------------
+    const norm = (u) => {
+        try {
+            const x = new URL(u, location.href);
+            x.hash = '';
+            let s = x.href;
+            return s.replace(/\/$/, '');
+        } catch (_) { return u; }
+    };
+
+    const loadTour = () => {
+        try { return JSON.parse(GM_getValue(TOUR_KEY, 'null')); } catch (_) { return null; }
+    };
+    const saveTour = (t) => GM_setValue(TOUR_KEY, JSON.stringify(t));
+
+    function inChrome(el) {
+        // true if inside site chrome (nav/header/footer/aside) — not main content
+        return !!el.closest('nav,header,footer,aside,[role="navigation"],[role="banner"],[role="contentinfo"]');
+    }
+
+    function signature(a) {
+        // Structural fingerprint of an anchor: tag+class chain of up to 4 ancestors.
+        let parts = [];
+        let el = a;
+        for (let i = 0; i < 4 && el && el.tagName; i++) {
+            const cls = (el.getAttribute('class') || '')
+                .trim().split(/\s+/).slice(0, 2)
+                .map(c => c.replace(/\d+/g, '#')).join('.');
+            parts.push(el.tagName.toLowerCase() + (cls ? '.' + cls : ''));
+            el = el.parentElement;
+        }
+        return parts.join('>');
+    }
+
+    // ---------------- Detection ----------------
+    function detectTopics() {
+        const here = norm(location.href);
+        const anchors = Array.from(document.querySelectorAll('a[href]'));
+        const groups = new Map();
+
+        for (const a of anchors) {
+            const raw = a.getAttribute('href');
+            if (!raw || raw.startsWith('#') || /^(javascript|mailto|tel):/i.test(raw)) continue;
+            let url;
+            try { url = new URL(a.href); } catch (_) { continue; }
+            if (url.origin !== location.origin) continue;         // same-site topics only
+            const nurl = norm(a.href);
+            if (nurl === here) continue;                          // not the current page
+            if (NEGATIVE.test(nurl)) continue;
+            if (inChrome(a)) continue;
+            const text = (a.textContent || '').trim();
+            if (!text) continue;
+
+            const sig = signature(a);
+            if (!groups.has(sig)) groups.set(sig, []);
+            groups.get(sig).push({ url: nurl, text });
+        }
+
+        let best = null, bestScore = 0;
+        for (const [, items] of groups) {
+            // dedupe by url, keep first (usually the title link)
+            const seen = new Set();
+            const uniq = items.filter(it => !seen.has(it.url) && seen.add(it.url));
+            if (uniq.length < MIN_CLUSTER) continue;
+
+            const patternHits = uniq.filter(it => TOPIC_PATTERNS.some(p => p.test(it.url))).length;
+            const wordy = uniq.filter(it => it.text.length >= MIN_TITLE_LEN).length;
+
+            // score: size + wordiness + heavy bonus for known patterns
+            let score = uniq.length + wordy * 0.5 + (patternHits / uniq.length) * uniq.length * 2;
+            if (score > bestScore) { bestScore = score; best = uniq; }
+        }
+        return best; // array of {url, text} in document order, or null
+    }
+
+    function detectNextPage() {
+        // rel=next first
+        let el = document.querySelector('a[rel~="next"], link[rel~="next"]');
+        if (el && el.href) return norm(el.href);
+        // then anchors whose text/aria look like "next"
+        const rx = /^(next|older|more|›|»|>>|→)$/i;
+        const cands = Array.from(document.querySelectorAll('a[href]'));
+        for (const a of cands) {
+            const t = (a.textContent || '').trim();
+            const al = (a.getAttribute('aria-label') || '').trim();
+            if ((rx.test(t) || /next|older/i.test(al)) && !inChrome(a)) {
+                try {
+                    if (new URL(a.href).origin === location.origin) return norm(a.href);
+                } catch (_) {}
+            }
+        }
+        return null;
+    }
+
+    // ---------------- UI ----------------
+    let bar;
+    function buildBar() {
+        if (bar) return bar;
+        bar = document.createElement('div');
+        Object.assign(bar.style, {
+            position: 'fixed', zIndex: 2147483647, right: '16px', bottom: '16px',
+            display: 'flex', alignItems: 'center', gap: '6px',
+            padding: '6px 8px', borderRadius: '10px',
+            background: 'rgba(28,28,32,0.92)', color: '#fff',
+            font: '13px/1.2 system-ui, sans-serif',
+            boxShadow: '0 4px 14px rgba(0,0,0,0.35)', userSelect: 'none',
+            backdropFilter: 'blur(4px)'
+        });
+        const pos = (() => { try { return JSON.parse(GM_getValue(POS_KEY, 'null')); } catch (_) { return null; } })();
+        if (pos) { bar.style.right = pos.right + 'px'; bar.style.bottom = pos.bottom + 'px'; }
+        document.body.appendChild(bar);
+        makeDraggable(bar);
+        return bar;
+    }
+
+    function mkBtn(label, title, onClick) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.title = title || '';
+        Object.assign(b.style, {
+            cursor: 'pointer', border: 'none', borderRadius: '7px',
+            padding: '5px 9px', font: 'inherit', fontWeight: '600',
+            background: 'rgba(255,255,255,0.14)', color: '#fff'
+        });
+        b.addEventListener('mouseenter', () => b.style.background = 'rgba(255,255,255,0.26)');
+        b.addEventListener('mouseleave', () => b.style.background = 'rgba(255,255,255,0.14)');
+        b.addEventListener('click', (e) => { e.preventDefault(); onClick(); });
+        return b;
+    }
+
+    function mkLabel(text) {
+        const s = document.createElement('span');
+        s.textContent = text;
+        s.style.padding = '0 4px';
+        s.style.whiteSpace = 'nowrap';
+        return s;
+    }
+
+    function makeDraggable(el) {
+        let sx, sy, sr, sb, drag = false;
+        el.addEventListener('mousedown', (e) => {
+            if (e.target.tagName === 'BUTTON') return;
+            drag = true;
+            sx = e.clientX; sy = e.clientY;
+            const r = el.getBoundingClientRect();
+            sr = window.innerWidth - r.right; sb = window.innerHeight - r.bottom;
+            e.preventDefault();
+        });
+        window.addEventListener('mousemove', (e) => {
+            if (!drag) return;
+            const right = Math.max(0, sr - (e.clientX - sx));
+            const bottom = Math.max(0, sb - (e.clientY - sy));
+            el.style.right = right + 'px'; el.style.bottom = bottom + 'px';
+        });
+        window.addEventListener('mouseup', () => {
+            if (!drag) return; drag = false;
+            const r = el.getBoundingClientRect();
+            GM_setValue(POS_KEY, JSON.stringify({
+                right: Math.round(window.innerWidth - r.right),
+                bottom: Math.round(window.innerHeight - r.bottom)
+            }));
+        });
+    }
+
+    function clearBar() { if (bar) bar.textContent = ''; }
+
+    function startTour(topics, nextPage) {
+        const tour = {
+            urls: topics.map(t => t.url),
+            titles: topics.map(t => t.text),
+            source: norm(location.href),
+            nextPage: nextPage || null,
+            ts: Date.now()
+        };
+        saveTour(tour);
+        location.href = tour.urls[0];
+    }
+
+    function go(url) { location.href = url; }
+
+    function render() {
+        const tour = loadTour();
+        const here = norm(location.href);
+
+        // Are we currently on a topic that belongs to the active tour?
+        if (tour && tour.urls) {
+            const idx = tour.urls.indexOf(here);
+            if (idx !== -1) {
+                buildBar(); clearBar();
+                const back = mkBtn('◀', 'Previous topic');
+                const next = mkBtn('▶', 'Next topic');
+                const lbl = mkLabel(`${idx + 1} / ${tour.urls.length}`);
+
+                back.addEventListener('click', () => {
+                    if (idx > 0) go(tour.urls[idx - 1]);
+                    else if (tour.source) go(tour.source);
+                });
+                next.addEventListener('click', () => {
+                    if (idx < tour.urls.length - 1) go(tour.urls[idx + 1]);
+                    else if (AUTO_CHAIN && tour.nextPage) { GM_setValue(RESUME_KEY, '1'); go(tour.nextPage); }
+                });
+                if (idx === 0) back.title = 'Back to index';
+                if (idx === tour.urls.length - 1 && !(AUTO_CHAIN && tour.nextPage)) {
+                    next.style.opacity = '0.4'; next.style.cursor = 'default';
+                } else if (idx === tour.urls.length - 1) {
+                    next.textContent = '⏭'; next.title = 'Next page → first topic';
+                }
+                bar.append(back, lbl, next);
+                return;
+            }
+        }
+
+        // Not in a tour here — is this a list page? Detect + offer to start.
+        const topics = detectTopics();
+        const resume = GM_getValue(RESUME_KEY, '');
+
+        if (topics && topics.length >= MIN_CLUSTER) {
+            const nextPage = detectNextPage();
+            if (resume) {
+                // arrived from a previous page's "next"; auto-capture and jump in
+                GM_deleteValue(RESUME_KEY);
+                startTour(topics, nextPage);
+                return;
+            }
+            buildBar(); clearBar();
+            const start = mkBtn(`📑 ${topics.length} topics — Start`, 'Capture these topics and open the first');
+            start.addEventListener('click', () => startTour(topics, nextPage));
+            const hide = mkBtn('✕', 'Hide');
+            hide.addEventListener('click', () => bar.remove());
+            bar.append(start, hide);
+        } else if (resume) {
+            // resume flag set but no list detected here — clear it to avoid confusion
+            GM_deleteValue(RESUME_KEY);
+        }
+    }
+
+    // ---------------- Menu commands ----------------
+    GM_registerMenuCommand('Forum Stumbler: re-scan this page', () => { if (bar) bar.remove(); bar = null; render(); });
+    GM_registerMenuCommand('Forum Stumbler: clear saved tour', () => {
+        GM_deleteValue(TOUR_KEY); GM_deleteValue(RESUME_KEY);
+        if (bar) bar.remove(); bar = null;
+    });
+
+    // ---------------- Boot ----------------
+    // Forums often lazy-render lists; try now and once more shortly after.
+    render();
+    setTimeout(() => { if (!bar) render(); }, 1200);
+})();
