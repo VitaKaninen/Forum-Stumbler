@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.2.0
+// @version     0.3.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Shows the source forum name and pulls the next page of results in the background.
 // @match       *://*/*
@@ -100,7 +100,12 @@
             if (nurl === here) continue;                          // not the current page
             if (NEGATIVE.test(nurl)) continue;
             if (inChrome(a)) continue;
+            // Skip in-topic pagination ("Go to page: 1, 2") and paging arrows: their
+            // visible text is just a number or a single symbol, never a topic title.
+            if (a.closest('.pagination, .pager, .pages, [class*="pagination"], [class*="pager"]')) continue;
             const text = (a.textContent || '').trim();
+            if (text.length < 2) continue;            // single chars: » « ‹ › etc.
+            if (/^\d{1,5}$/.test(text)) continue;     // bare page numbers: 1, 2, 3…
             if (!text) continue;
 
             const sig = signature(a);
@@ -315,6 +320,35 @@
                 const back = mkBtn('◀', idx === 0 ? 'Back to index' : 'Previous topic');
                 const next = mkBtn('▶', 'Next topic');
                 const lbl = mkLabel(`${idx + 1} / ${tour.urls.length}`);
+                lbl.style.cursor = 'pointer';
+                lbl.title = 'Click to jump to a topic number';
+
+                // Click the counter -> inline number box -> Enter jumps to that topic.
+                lbl.addEventListener('click', () => {
+                    const input = document.createElement('input');
+                    input.type = 'number';
+                    input.min = '1'; input.max = String(tour.urls.length);
+                    input.value = String(idx + 1);
+                    Object.assign(input.style, {
+                        width: '58px', font: 'inherit', textAlign: 'center',
+                        borderRadius: '6px', border: '1px solid rgba(255,255,255,0.3)',
+                        background: '#fff', color: '#111'
+                    });
+                    let done = false;
+                    const commit = () => {
+                        if (done) return; done = true;
+                        const n = parseInt(input.value, 10);
+                        if (!isNaN(n) && n >= 1 && n <= tour.urls.length && n !== idx + 1) go(tour.urls[n - 1]);
+                        else input.replaceWith(lbl); // no-op / cancel -> restore label
+                    };
+                    input.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') { e.preventDefault(); commit(); }
+                        else if (e.key === 'Escape') { done = true; input.replaceWith(lbl); }
+                    });
+                    input.addEventListener('blur', commit);
+                    lbl.replaceWith(input);
+                    input.focus(); input.select();
+                });
 
                 back.addEventListener('click', () => {
                     if (idx > 0) go(tour.urls[idx - 1]);
