@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.3.0
+// @version     0.4.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Shows the source forum name and pulls the next page of results in the background.
 // @match       *://*/*
@@ -9,6 +9,8 @@
 // @grant       GM_getValue
 // @grant       GM_deleteValue
 // @grant       GM_registerMenuCommand
+// @grant       GM_xmlhttpRequest
+// @connect     *
 // @run-at      document-idle
 // @downloadURL  https://raw.githubusercontent.com/VitaKaninen/Forum-Stumbler/main/Forum-Stumbler.user.js
 // @updateURL    https://raw.githubusercontent.com/VitaKaninen/Forum-Stumbler/main/Forum-Stumbler.user.js
@@ -163,16 +165,20 @@
         if (bar) return bar;
         bar = document.createElement('div');
         Object.assign(bar.style, {
-            position: 'fixed', zIndex: 2147483647, right: '16px', bottom: '16px',
+            position: 'fixed', zIndex: 2147483647, right: '0px', bottom: '0px',
             display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '4px',
-            padding: '6px 8px', borderRadius: '10px',
+            padding: '6px 8px', borderRadius: '10px 0 0 0',
             background: 'rgba(28,28,32,0.92)', color: '#fff',
             font: '13px/1.2 system-ui, sans-serif',
             boxShadow: '0 4px 14px rgba(0,0,0,0.35)', userSelect: 'none',
             backdropFilter: 'blur(4px)'
         });
+        // Restore a dragged position, clamped so a narrower page can't hide it.
         const pos = (() => { try { return JSON.parse(GM_getValue(POS_KEY, 'null')); } catch (_) { return null; } })();
-        if (pos) { bar.style.right = pos.right + 'px'; bar.style.bottom = pos.bottom + 'px'; }
+        if (pos) {
+            bar.style.right = Math.min(Math.max(0, pos.right | 0), Math.max(0, window.innerWidth - 40)) + 'px';
+            bar.style.bottom = Math.min(Math.max(0, pos.bottom | 0), Math.max(0, window.innerHeight - 30)) + 'px';
+        }
         document.body.appendChild(bar);
         makeDraggable(bar);
         return bar;
@@ -276,17 +282,36 @@
         return addUrls[0];
     }
 
-    // End-of-tour: fetch the next results page in the background, parse it, append its
-    // topics, and jump to the first new one. Falls back to a visible navigation if the
-    // page can't be fetched/parsed (e.g. JS-rendered lists).
+    // Fetch a page's HTML without navigating. GM_xmlhttpRequest is tried first because it
+    // is not subject to the page's CSP/connect-src (a plain fetch often is); plain fetch is
+    // the fallback for managers that don't provide it.
+    function fetchHtml(url) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest === 'function') {
+                GM_xmlhttpRequest({
+                    method: 'GET', url,
+                    onload: (r) => (r.status >= 200 && r.status < 400) ? resolve(r.responseText) : reject(new Error('HTTP ' + r.status)),
+                    onerror: () => reject(new Error('network')),
+                    ontimeout: () => reject(new Error('timeout')),
+                    timeout: 15000
+                });
+            } else {
+                fetch(url, { credentials: 'same-origin' })
+                    .then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
+                    .then(resolve, reject);
+            }
+        });
+    }
+
+    // End-of-tour: pull the next results page in the background, parse it, append its
+    // topics, and jump to the first new one. Falls back to a visible navigation only if
+    // the page can't be fetched/parsed (e.g. JS-rendered lists).
     async function pullNextPage(tour, nextBtn) {
         if (!tour.nextPage) return;
         const target = tour.nextPage;
         if (nextBtn) { nextBtn.textContent = '…'; nextBtn.title = 'Loading next page…'; }
         try {
-            const resp = await fetch(target, { credentials: 'same-origin' });
-            if (!resp.ok) throw new Error('HTTP ' + resp.status);
-            const html = await resp.text();
+            const html = await fetchHtml(target);
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const topics = detectTopics(doc, target);
             if (!topics || topics.length < MIN_CLUSTER) throw new Error('no topics in fetched page');
