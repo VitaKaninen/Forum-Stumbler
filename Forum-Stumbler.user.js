@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.11.0
+// @version     0.12.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
@@ -371,23 +371,26 @@
         return bestCluster(true) || bestCluster(false);
     }
 
-    // Detection order for an opted-in site. A taught site uses ONLY its taught rules
-    // (structure → URL pattern, minus exceptions): on pages where they match nothing
-    // (thread pages, subforum listings) the script stays quiet instead of guessing.
-    // Un-taught sites use the heuristic.
+    // Detection for an opted-in site. A taught site uses ONLY its taught rules
+    // (minus exceptions): on pages where they match nothing (thread pages, subforum
+    // listings) the script stays quiet instead of guessing. Structure and URL
+    // pattern are UNIONED, not tried in order: infinite-scroll sites (Reddit)
+    // render later batches with different markup, so the structure catches one
+    // layout and the URL pattern catches the rest. Un-taught sites use the heuristic.
     function detectForSite(root, base, cfg) {
         if (cfg && (cfg.sig || cfg.pattern)) {
             const rxs = compileExcludes(cfg.exclude);
             const exSigs = (cfg.excludeSigs && cfg.excludeSigs.length) ? cfg.excludeSigs : null;
-            if (cfg.sig) {
-                const r = filterExcluded(detectTopics(root, base, cfg.sig, exSigs), rxs);
-                if (r && r.length >= MIN_TAUGHT) return r;
+            const byUrl = new Map();
+            const lists = [
+                cfg.sig ? detectTopics(root, base, cfg.sig, exSigs) : null,
+                cfg.pattern ? detectByPattern(root, base, cfg.pattern, exSigs) : null
+            ];
+            for (const list of lists) {
+                for (const t of (list || [])) if (!byUrl.has(t.url)) byUrl.set(t.url, t);
             }
-            if (cfg.pattern) {
-                const r = filterExcluded(detectByPattern(root, base, cfg.pattern, exSigs), rxs);
-                if (r && r.length >= MIN_TAUGHT) return r;
-            }
-            return null;
+            const merged = filterExcluded(Array.from(byUrl.values()), rxs);
+            return (merged && merged.length >= MIN_TAUGHT) ? merged : null;
         }
         return detectTopics(root, base);
     }
@@ -478,9 +481,23 @@
     }
 
     function deriveFromUrls(urls) {
+        // Mixed path depths: derive from the dominant depth when it clearly dominates
+        // (a stray odd link among many uniform ones), else give up.
+        const byDepth = new Map();
+        for (const u of urls) {
+            const d = pathSegs(u.pathname).length;
+            if (!byDepth.has(d)) byDepth.set(d, []);
+            byDepth.get(d).push(u);
+        }
+        let major = null;
+        for (const g of byDepth.values()) if (!major || g.length > major.length) major = g;
+        if (byDepth.size > 1) {
+            if (major.length < 3 || major.length * 2 < urls.length) return null;
+            urls = major;
+        }
         const segLists = urls.map(u => pathSegs(u.pathname));
         const depth = segLists[0].length;
-        if (!depth || !segLists.every(s => s.length === depth)) return null;
+        if (!depth) return null;
         const parts = [];
         for (let i = 0; i < depth; i++) {
             const vals = Array.from(new Set(segLists.map(s => s[i])));
@@ -1659,6 +1676,37 @@
         root.appendChild(overlay);
         document.documentElement.appendChild(host);
     }
+
+    // ---------------- SPA navigation ----------------
+    // Reddit (shreddit) intercepts same-origin navigations with the Navigation API,
+    // so location.href assignments and Back/Forward often DON'T reload the page —
+    // this script instance survives the "navigation". Without re-rendering, the tour
+    // bar never appears after Start, the stale capture pill keeps accumulating, and
+    // the pending topic index is consumed by the wrong page after a later refresh.
+    // Watch for URL changes and re-render. Skipped mid-teach (exitCapture rescans).
+    let lastHref = location.href;
+    function onUrlMaybeChanged() {
+        setTimeout(() => {
+            if (location.href === lastHref) return;
+            lastHref = location.href;
+            if (teach) return;
+            setTimeout(rescan, 250); // let the new view start rendering first
+        }, 0);
+    }
+    if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+        window.navigation.addEventListener('navigatesuccess', onUrlMaybeChanged);
+    } else {
+        // No Navigation API (Firefox): hook the history methods SPAs use. This runs
+        // in the userscript sandbox; if the wrapper doesn't forward the assignment,
+        // popstate below still covers Back/Forward.
+        try {
+            for (const m of ['pushState', 'replaceState']) {
+                const orig = history[m];
+                history[m] = function () { const r = orig.apply(this, arguments); onUrlMaybeChanged(); return r; };
+            }
+        } catch (_) {}
+    }
+    window.addEventListener('popstate', onUrlMaybeChanged);
 
     // ---------------- Menu commands ----------------
     GM_registerMenuCommand('Forum Stumbler: settings', openSettings);
