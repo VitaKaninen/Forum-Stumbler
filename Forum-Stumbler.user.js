@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.12.0
+// @version     0.13.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
@@ -558,25 +558,29 @@
             .filter(p => typeof p === 'string' && p);
     }
     // Anchors on the live page matched by the rule being taught/edited: structure
-    // first, stored URL pattern as fallback (mirrors detectForSite, but keeps the
-    // anchor elements so they can be highlighted).
+    // UNIONED with the stored URL pattern — exactly what detectForSite captures, but
+    // keeping the anchor elements so they can be highlighted. Must stay a union: when
+    // this used the pattern only as a fallback, the green preview showed just the
+    // structure matches (e.g. 25) while capture took structure ∪ pattern (e.g. 57),
+    // and the extras were invisible to the Exceptions flow — clicking them did nothing
+    // because pickException ignores links outside includedRecords().
     function matchedRecords() {
-        let recs = teach.sig ? clusterForSig(teach.sig) : [];
-        if (!recs.length && teach.pattern) {
+        const byUrl = new Map();
+        const add = (r) => {
+            const prev = byUrl.get(r.url);
+            if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
+        };
+        if (teach.sig) clusterForSig(teach.sig).forEach(add);
+        if (teach.pattern) {
             let rx;
             try { rx = new RegExp(teach.pattern, 'i'); } catch (_) { rx = null; }
             if (rx) {
-                const all = collectAnchors(document, location.href, false) || [];
-                const byUrl = new Map();
-                for (const r of all) {
-                    if (!rx.test(r.urlObj.pathname + r.urlObj.search)) continue;
-                    const prev = byUrl.get(r.url);
-                    if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
+                for (const r of (collectAnchors(document, location.href, false) || [])) {
+                    if (rx.test(r.urlObj.pathname + r.urlObj.search)) add(r);
                 }
-                recs = Array.from(byUrl.values());
             }
         }
-        return recs;
+        return Array.from(byUrl.values());
     }
     function includedRecords() {
         const rxs = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
@@ -895,10 +899,14 @@
             cfg.pattern = teach.pattern;
             cfg.exclude = computeExcludePatterns();
             cfg.excludeSigs = [];
-            // Remember the verified links' deep markup chains — the known-good
-            // reference that later lets an exception rule prove it only removes
-            // links in OTHER positions (even on pages with no good links).
-            cfg.goodSigs = Array.from(new Set(includedRecords().map(r => sigDeep(r.a)))).slice(0, 12);
+            // Remember the deep markup chains of the STRUCTURE matches only — the
+            // known-good reference that later lets an exception rule prove it only
+            // removes links in OTHER positions (even on pages with no good links).
+            // Deliberately not includedRecords(): that also holds the URL-pattern
+            // matches, which are exactly the links Exceptions exists to remove —
+            // marking them good would make every position rule refuse to fire.
+            const goodRecs = teach.sig ? clusterForSig(teach.sig) : includedRecords();
+            cfg.goodSigs = Array.from(new Set(goodRecs.map(r => sigDeep(r.a)))).slice(0, 12);
             saveSites(sites);
         }
         clearHighlights();
