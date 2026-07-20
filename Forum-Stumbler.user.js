@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.13.0
+// @version     0.14.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
@@ -400,13 +400,15 @@
     // text/active), so next = that number + 1. Naturally yields nothing on the last
     // page. Works regardless of URL shape, including offset schemes where page 1 omits
     // the offset (…vf13.htm) and page 2 adds it (…vf13,25.htm).
+    // The pickers return the whole record ({ a, url, … }) rather than just the URL so
+    // the debug drawer can highlight the very anchor the tour will follow.
     function pickNumericNext(anchors) {
         const byNum = new Map();
         for (const r of anchors) {
             if (!/^\d{1,6}$/.test(r.text)) continue;
             const n = parseInt(r.text, 10);
             if (!n || byNum.has(n)) continue;
-            byNum.set(n, r.url);
+            byNum.set(n, r);
         }
         if (!byNum.size) return null;
         let current = 1;
@@ -417,21 +419,23 @@
     function pickTextNext(anchors) {
         for (const r of anchors) {
             const al = (r.a.getAttribute('aria-label') || '').trim();
-            if (NEXT_TEXT.test(r.text) || (/next|older/i.test(al) && !/prev|newer/i.test(al))) return r.url;
+            if (NEXT_TEXT.test(r.text) || (/next|older/i.test(al) && !/prev|newer/i.test(al))) return r;
         }
         return null;
     }
 
     // Next-page order: taught pager signature → rel=next → numeric page links →
-    // narrowed forward-text/arrow. Always returns a same-site normalized URL or null.
-    function detectNextPage(root, base, cfg) {
+    // narrowed forward-text/arrow. Returns { url, a, how } or null; `how` names the
+    // rule that fired (shown in the debug drawer) and `a` may be null for a
+    // <link rel=next> in the head.
+    function detectNextRecord(root, base, cfg) {
         base = base || location.href;
         const anchors = allAnchors(root, base);
 
         if (cfg && cfg.nextSig) {
             const grp = anchors.filter(r => signature(r.a, true) === cfg.nextSig);
-            const r = pickNumericNext(grp) || pickTextNext(grp) || (grp.length === 1 ? grp[0].url : null);
-            if (r) return r;
+            const r = pickNumericNext(grp) || pickTextNext(grp) || (grp.length === 1 ? grp[0] : null);
+            if (r) return { url: r.url, a: r.a, how: 'taught pager link' };
         }
 
         let origin;
@@ -442,12 +446,23 @@
             if (raw) {
                 try {
                     const u = new URL(raw, base);
-                    if (u.origin === origin) return norm(u.href, base);
+                    if (u.origin === origin) {
+                        return { url: norm(u.href, base), a: /^a$/i.test(el.tagName) ? el : null, how: 'rel="next"' };
+                    }
                 } catch (_) {}
             }
         }
 
-        return pickNumericNext(anchors) || pickTextNext(anchors);
+        const num = pickNumericNext(anchors);
+        if (num) return { url: num.url, a: num.a, how: 'numeric page link' };
+        const txt = pickTextNext(anchors);
+        if (txt) return { url: txt.url, a: txt.a, how: 'next/older text link' };
+        return null;
+    }
+
+    function detectNextPage(root, base, cfg) {
+        const r = detectNextRecord(root, base, cfg);
+        return r ? r.url : null;
     }
 
     // ---------------- Teaching: pattern derivation ----------------
@@ -557,23 +572,24 @@
             .map(g => g.length >= 2 ? deriveFromUrls(g) : digitGen(g[0]))
             .filter(p => typeof p === 'string' && p);
     }
-    // Anchors on the live page matched by the rule being taught/edited: structure
-    // UNIONED with the stored URL pattern — exactly what detectForSite captures, but
-    // keeping the anchor elements so they can be highlighted. Must stay a union: when
-    // this used the pattern only as a fallback, the green preview showed just the
-    // structure matches (e.g. 25) while capture took structure ∪ pattern (e.g. 57),
-    // and the extras were invisible to the Exceptions flow — clicking them did nothing
-    // because pickException ignores links outside includedRecords().
-    function matchedRecords() {
+    // Anchors on the live page matched by a rule ({ sig, pattern } — a stored site cfg
+    // or the in-progress teach state): structure UNIONED with the URL pattern, exactly
+    // what detectForSite captures, but keeping the anchor elements so they can be
+    // highlighted. Must stay a union: when this used the pattern only as a fallback,
+    // the green preview showed just the structure matches (e.g. 25) while capture took
+    // structure ∪ pattern (e.g. 57), and the extras were invisible to the Exceptions
+    // flow — clicking them did nothing because pickException ignores links outside
+    // includedRecords().
+    function ruleRecords(rule) {
         const byUrl = new Map();
         const add = (r) => {
             const prev = byUrl.get(r.url);
             if (!prev || r.text.length > prev.text.length) byUrl.set(r.url, r);
         };
-        if (teach.sig) clusterForSig(teach.sig).forEach(add);
-        if (teach.pattern) {
+        if (rule.sig) clusterForSig(rule.sig).forEach(add);
+        if (rule.pattern) {
             let rx;
-            try { rx = new RegExp(teach.pattern, 'i'); } catch (_) { rx = null; }
+            try { rx = new RegExp(rule.pattern, 'i'); } catch (_) { rx = null; }
             if (rx) {
                 for (const r of (collectAnchors(document, location.href, false) || [])) {
                     if (rx.test(r.urlObj.pathname + r.urlObj.search)) add(r);
@@ -582,10 +598,23 @@
         }
         return Array.from(byUrl.values());
     }
+
+    // Split matched records by the exception rules: what survives vs what they remove.
+    function splitByExceptions(recs, exRxSrc, exSigs) {
+        const rxs = compileExcludes(exRxSrc);
+        const inc = [], exc = [];
+        for (const r of recs) {
+            if (excludedBySig(r.a, exSigs) || excludedByRx(r.urlObj, rxs)) exc.push(r);
+            else inc.push(r);
+        }
+        return { inc, exc };
+    }
+
+    const matchedRecords = () => ruleRecords(teach);
     function includedRecords() {
-        const rxs = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
-        const exSigs = teach.baseExcludeSigs.concat(teach.excludeSigs);
-        return matchedRecords().filter(r => !excludedBySig(r.a, exSigs) && !excludedByRx(r.urlObj, rxs));
+        return splitByExceptions(matchedRecords(),
+            teach.baseExcludes.concat(computeExcludePatterns()),
+            teach.baseExcludeSigs.concat(teach.excludeSigs)).inc;
     }
 
     function clearHighlights() {
@@ -708,21 +737,46 @@
         try { document.body.style.cursor = 'crosshair'; } catch (_) {}
     }
 
-    function startGuidedTeach(domain) {
+    function startGuidedTeach(domain, silent) {
         teach = {
-            domain, mode: 'full', step: 'topic', sig: null, pattern: null, goodSigs: [],
+            domain, mode: 'full', step: 'topic', silent: !!silent, sig: null, pattern: null, goodSigs: [],
             baseExcludes: [], baseExcludeSigs: [], excludeGroups: [], excludeSigs: []
         };
         enterCaptureMode();
         stepTopic();
     }
 
+    // Wipe the stored rules, then teach fresh. Cancel/Esc leaves them wiped — same
+    // contract whether it was launched from Settings or from the bar's debug drawer.
+    function wipeAndTeach(domain, silent) {
+        const s = getSites();
+        if (s[domain]) {
+            s[domain].sig = null; s[domain].pattern = null; s[domain].nextSig = null;
+            s[domain].exclude = []; s[domain].excludeSigs = []; s[domain].goodSigs = [];
+            saveSites(s);
+        }
+        startGuidedTeach(domain, silent);
+    }
+
+    // Next-page link only: the taught pager signature outranks auto-detection, so this
+    // is how a wrong "next" (the usual cause of a bogus topic appearing mid-tour) gets
+    // corrected without re-teaching the thread links.
+    function startNextTeach(domain) {
+        teach = {
+            domain, mode: 'nextonly', step: 'next', silent: true, sig: null, pattern: null, goodSigs: [],
+            baseExcludes: [], baseExcludeSigs: [], excludeGroups: [], excludeSigs: []
+        };
+        enterCaptureMode();
+        setPopup('Click the link that leads to page 2 of this list — the “next page” link the tour should follow.',
+            [['Cancel', '#45475a', '#cdd6f4', cancelCapture]]);
+    }
+
     // Exceptions-only flow: edits the stored rule additively, so nothing is wiped and
     // Cancel is a true no-op.
-    function startExceptionTeach(domain) {
+    function startExceptionTeach(domain, silent) {
         const cfg = getSites()[domain] || {};
         teach = {
-            domain, mode: 'except', step: 'except',
+            domain, mode: 'except', step: 'except', silent: !!silent,
             sig: cfg.sig || null, pattern: cfg.pattern || null,
             goodSigs: (cfg.goodSigs || []).slice(),
             baseExcludes: (cfg.exclude || []).slice(),
@@ -949,8 +1003,9 @@
 
     function finishTeach(msgText) {
         teach.step = 'done';
+        const silent = !!teach.silent;   // exitCapture nulls `teach` — read it now
         setPopup(msgText, []);
-        setTimeout(() => { exitCapture(); openSettings(); }, 1400);
+        setTimeout(() => { exitCapture(); if (!silent) openSettings(); }, 1400);
     }
 
     // ---------------- UI: floating bar ----------------
@@ -1061,12 +1116,202 @@
 
     function clearBar() { if (bar) bar.textContent = ''; }
 
+    function hideBar() {
+        if (liveObserver) { liveObserver.disconnect(); liveObserver = null; }
+        dbgClearHl();
+        if (bar) { bar.remove(); bar = null; }
+    }
+
+    // ---------------- Debug drawer ----------------
+    // Answers "why did the tour pick THAT link?" without opening Settings: highlights
+    // exactly what the taught rule matches on this page, what the exceptions strip out
+    // of it, and which link the script believes is "next page" — plus, on a topic page,
+    // which list page the current topic was captured from.
+    const dbg = { found: false, excl: false, next: false };
+    let dbgHl = [];
+    let drawerOpen = false;
+
+    function dbgClearHl() {
+        for (const h of dbgHl) { h.el.style.outline = h.outline; h.el.style.outlineOffset = h.offset; }
+        dbgHl = [];
+    }
+    function dbgMark(els, color) {
+        for (const el of els) {
+            if (!el) continue;
+            dbgHl.push({ el, outline: el.style.outline, offset: el.style.outlineOffset });
+            el.style.outline = '3px solid ' + color;
+            el.style.outlineOffset = '1px';
+        }
+    }
+
+    // Re-derive the three debug sets and paint whichever toggles are on.
+    function dbgRefresh(cfg) {
+        dbgClearHl();
+        const empty = { inc: [], exc: [], next: null, taught: false };
+        if (!cfg) return empty;
+        const taught = !!(cfg.sig || cfg.pattern);
+        let recs;
+        if (taught) {
+            recs = ruleRecords(cfg);
+        } else {
+            // Un-taught site: the heuristic returns URLs only, so map them back to
+            // anchors to have something to outline.
+            const urls = new Set((detectForSite(document, location.href, cfg) || []).map(t => t.url));
+            recs = (collectAnchors(document, location.href, true) || []).filter(r => urls.has(r.url));
+        }
+        const { inc, exc } = splitByExceptions(recs, cfg.exclude, cfg.excludeSigs);
+        const next = detectNextRecord(document, location.href, cfg);
+        if (dbg.found) dbgMark(inc.map(r => r.a), '#a6e3a1');
+        if (dbg.excl) dbgMark(exc.map(r => r.a), '#f38ba8');
+        if (dbg.next && next) dbgMark([next.a], '#89b4fa');
+        return { inc, exc, next, taught };
+    }
+
+    function dbgBtn(label, title) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.title = title || '';
+        Object.assign(b.style, {
+            cursor: 'pointer', border: 'none', borderRadius: '6px',
+            padding: '3px 7px', font: 'inherit', fontSize: '11px', fontWeight: '600',
+            background: 'rgba(255,255,255,0.14)', color: '#fff'
+        });
+        return b;
+    }
+
+    // The tiny ⚙ / ✕ header, kept on BOTH the capture pill and the tour bar so the
+    // widget can always be dismissed and inspected.
+    function mkBarTools(site, tour, idx) {
+        const row = document.createElement('div');
+        Object.assign(row.style, { display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '4px' });
+
+        const tiny = (label, title) => {
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.title = title;
+            Object.assign(b.style, {
+                cursor: 'pointer', border: 'none', background: 'transparent', color: '#fff',
+                font: 'inherit', fontSize: '11px', lineHeight: '1', padding: '1px 3px', opacity: '0.65'
+            });
+            b.addEventListener('mouseenter', () => b.style.opacity = '1');
+            b.addEventListener('mouseleave', () => b.style.opacity = '0.65');
+            return b;
+        };
+
+        const gear = tiny('⚙', 'Debug / teaching tools for this site');
+        const close = tiny('✕', 'Hide the Forum Stumbler bar on this page');
+        close.addEventListener('click', hideBar);
+        gear.addEventListener('click', () => {
+            drawerOpen = !drawerOpen;
+            const existing = bar.querySelector('[data-fs-drawer]');
+            if (existing) existing.remove();
+            // Prepended: the bar sits bottom-right, so a first child grows upward.
+            if (drawerOpen) bar.insertBefore(buildDrawer(site, tour, idx), bar.firstChild);
+        });
+
+        row.append(gear, close);
+        return row;
+    }
+
+    function buildDrawer(site, tour, idx) {
+        const cfg = site ? site.cfg : null;
+        const wrap = document.createElement('div');
+        wrap.setAttribute('data-fs-drawer', '1');
+        Object.assign(wrap.style, {
+            display: 'flex', flexDirection: 'column', gap: '6px',
+            padding: '7px 8px', marginBottom: '3px', borderRadius: '8px',
+            background: 'rgba(255,255,255,0.10)', width: '300px', maxWidth: '80vw'
+        });
+
+        const info = document.createElement('div');
+        Object.assign(info.style, {
+            fontSize: '11px', lineHeight: '1.45', opacity: '0.9',
+            wordBreak: 'break-all', whiteSpace: 'normal'
+        });
+
+        const toggles = document.createElement('div');
+        Object.assign(toggles.style, { display: 'flex', gap: '5px', flexWrap: 'wrap' });
+        const actions = document.createElement('div');
+        Object.assign(actions.style, { display: 'flex', gap: '5px', flexWrap: 'wrap' });
+
+        const paint = [];
+        const update = (scrollToNext) => {
+            const r = dbgRefresh(cfg);
+            for (const p of paint) p();
+            while (info.firstChild) info.removeChild(info.firstChild);
+            const line = (t, color) => {
+                const e = document.createElement('div');
+                e.textContent = t;
+                if (color) e.style.color = color;
+                info.appendChild(e);
+            };
+            if (!cfg) {
+                line('This site is not in the site list.');
+            } else {
+                line('Matched ' + (r.inc.length + r.exc.length) + ' · excluded ' + r.exc.length +
+                    ' · captured ' + r.inc.length + (r.taught ? '' : ' (heuristic — not taught)'));
+                line('Next page: ' + (r.next ? r.next.url : 'none found'),
+                    r.next ? '#89b4fa' : '#f9e2af');
+                if (r.next) line('  ↳ found via ' + r.next.how + (r.next.a ? '' : ' (in <head>, nothing to highlight)'), '#9399b2');
+            }
+            if (tour && typeof idx === 'number') {
+                const src = (tour.sources && tour.sources[idx]) || tour.source || 'unknown';
+                line('Topic ' + (idx + 1) + ' of ' + tour.urls.length + ' was captured from:', '#cdd6f4');
+                line('  ' + src, '#f9e2af');
+            }
+            if (scrollToNext && dbg.next && r.next && r.next.a) {
+                try { r.next.a.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+            }
+        };
+
+        const mkToggle = (label, key, color, title) => {
+            const b = dbgBtn(label, title);
+            const repaint = () => {
+                b.style.background = dbg[key] ? color : 'rgba(255,255,255,0.14)';
+                b.style.color = dbg[key] ? '#1e1e2e' : '#fff';
+            };
+            paint.push(repaint);
+            b.addEventListener('click', () => { dbg[key] = !dbg[key]; update(key === 'next'); });
+            toggles.appendChild(b);
+        };
+        mkToggle('Found', 'found', '#a6e3a1', 'Outline every link this page contributes to a tour');
+        mkToggle('Excluded', 'excl', '#f38ba8', 'Outline links the rule matches but the exceptions remove');
+        mkToggle('Next link', 'next', '#89b4fa', 'Outline (and scroll to) the link the tour follows for page 2');
+
+        if (site) {
+            const d = site.domain;
+            const teachBtn = dbgBtn('Re-teach', 'Erase this site’s rules and learn the thread links again from this page');
+            teachBtn.addEventListener('click', () => { hideBar(); wipeAndTeach(d, true); });
+            const excBtn = dbgBtn('Exceptions', 'Click wrong links to exclude them — added on top of the existing exceptions');
+            excBtn.addEventListener('click', () => { hideBar(); startExceptionTeach(d, true); });
+            const nextBtn = dbgBtn('Teach next link', 'Click the real page-2 link to correct a wrong “next page”');
+            nextBtn.addEventListener('click', () => { hideBar(); startNextTeach(d); });
+            const setBtn = dbgBtn('Settings…', 'Open the full Forum Stumbler settings');
+            setBtn.addEventListener('click', openSettings);
+            actions.append(teachBtn, excBtn, nextBtn, setBtn);
+            if (!(cfg && (cfg.sig || cfg.pattern))) {
+                excBtn.disabled = true;
+                excBtn.style.opacity = '0.4';
+                excBtn.title = 'Teach the thread links first';
+            }
+        }
+
+        update(false);
+        wrap.append(info, toggles, actions);
+        return wrap;
+    }
+
     // ---------------- Tour lifecycle ----------------
     function startTour(topics, nextPage) {
+        const here = norm(location.href);
         const tour = {
             urls: topics.map(t => t.url),
             titles: topics.map(t => t.text),
-            source: norm(location.href),
+            // Which list page each topic was captured from — the debug drawer shows it,
+            // which is the only way to tell a stray match on the index apart from a
+            // topic pulled off a wrongly-detected "next page".
+            sources: topics.map(() => here),
+            source: here,
             sourceTitle: (document.title || location.hostname).trim(),
             nextPage: nextPage || null,
             ts: Date.now()
@@ -1085,8 +1330,11 @@
             if (!existing.has(t.url)) { existing.add(t.url); addUrls.push(t.url); addTitles.push(t.text); }
         }
         if (!addUrls.length) return null;
+        if (!Array.isArray(tour.sources)) tour.sources = tour.urls.map(() => tour.source || '');
         tour.urls = tour.urls.concat(addUrls);
         tour.titles = tour.titles.concat(addTitles);
+        const from = newNextBase ? norm(newNextBase) : '';
+        tour.sources = tour.sources.concat(addUrls.map(() => from));
         const nn = newNext ? norm(newNext, newNextBase) : null;
         tour.nextPage = (nn && !tour.urls.includes(nn) && nn !== tour.nextPage) ? nn : null;
         saveTour(tour);
@@ -1169,6 +1417,8 @@
 
     function renderTourBar(tour, idx) {
         buildBar(); clearBar();
+        drawerOpen = false;
+        bar.appendChild(mkBarTools(getSiteFor(location.hostname), tour, idx));
         const goTopic = (i) => { setPending(i); go(tour.urls[i]); };
 
         const title = mkTitle(tour.sourceTitle || 'Forum');
@@ -1253,10 +1503,11 @@
     function buildStartPill(site) {
         if (waitObserver) { waitObserver.disconnect(); waitObserver = null; }
         buildBar(); clearBar();
+        drawerOpen = false;
+        bar.appendChild(mkBarTools(site, null, null));
 
         const row = mkRow();
         const start = mkBtn('📑 … — Start', 'Capture these topics and open the first (scroll to gather more)');
-        const hide = mkBtn('✕', 'Hide');
         const acc = new Map();  // url -> {url, text}, insertion order = discovery order
         let lastNext = null;
 
@@ -1273,12 +1524,7 @@
         start.addEventListener('click', () => {
             if (acc.size) startTour(Array.from(acc.values()), lastNext);
         });
-        hide.addEventListener('click', () => {
-            if (liveObserver) { liveObserver.disconnect(); liveObserver = null; }
-            bar.remove();
-        });
-
-        row.append(start, hide);
+        row.append(start);
         bar.append(row);
 
         // Live growth, event-driven (only fires when the DOM actually changes), throttled.
@@ -1307,6 +1553,10 @@
     function rescan() {
         if (liveObserver) { liveObserver.disconnect(); liveObserver = null; }
         if (waitObserver) { waitObserver.disconnect(); waitObserver = null; }
+        // Outlines point at anchors that may be about to vanish (SPA re-render) —
+        // restore them before the bar is rebuilt.
+        dbgClearHl();
+        drawerOpen = false;
         if (bar) { bar.remove(); bar = null; }
         render();
     }
@@ -1353,7 +1603,7 @@
         descMain.textContent = 'Forum Stumbler only scans the sites listed here (opt-in). By default a site is scoped to the subforum pages you add; tick "whole site" to scan everywhere on it.';
         const descTeach = document.createElement('div');
         descTeach.style.cssText = 'margin-top: 4px; color: #6c7086; font-style: italic;';
-        descTeach.textContent = 'Teach threads: a popup guides you — click the first thread link, then verify the green highlights (re-teaching wipes the old rules, exceptions included). Exceptions: on any page, highlights what the rule catches so you can click wrong links to exclude them — new exceptions are added to the existing ones.';
+        descTeach.textContent = 'The ⚙ button on the floating bar opens a per-site drawer that highlights what is captured, what the exceptions remove, and which link is treated as “next page” (with a way to re-teach it). Teach threads: a popup guides you — click the first thread link, then verify the green highlights (re-teaching wipes the old rules, exceptions included). Exceptions: on any page, highlights what the rule catches so you can click wrong links to exclude them — new exceptions are added to the existing ones.';
         desc.appendChild(descMain);
         desc.appendChild(descTeach);
 
@@ -1462,14 +1712,8 @@
                 if (onSite) {
                     teachBtn.title = 'Erase the taught rules (exceptions included) and learn the thread links fresh from this page';
                     teachBtn.addEventListener('click', () => {
-                        const s = getSites();
-                        if (s[d]) {
-                            s[d].sig = null; s[d].pattern = null; s[d].nextSig = null;
-                            s[d].exclude = []; s[d].excludeSigs = []; s[d].goodSigs = [];
-                            saveSites(s);
-                        }
                         host.remove();
-                        startGuidedTeach(d);
+                        wipeAndTeach(d);
                     });
                 } else {
                     teachBtn.style.opacity = '0.4';
