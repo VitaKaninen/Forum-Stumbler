@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Forum Stumbler
 // @namespace   https://github.com/VitaKaninen
-// @version     0.14.0
+// @version     0.15.0
 // @author      VitaKaninen
 // @description Capture every topic link on a forum index page, then walk them with Back/Next buttons — no tabs. Opt-in per site, guided click-to-teach with highlight-and-verify plus exception rules, accumulating capture for infinite scroll.
 // @match       *://*/*
@@ -165,7 +165,12 @@
                     nextSig: typeof cfg.nextSig === 'string' ? cfg.nextSig : null,
                     exclude: Array.isArray(cfg.exclude) ? cfg.exclude.filter(p => typeof p === 'string' && p) : [],
                     excludeSigs: Array.isArray(cfg.excludeSigs) ? cfg.excludeSigs.filter(p => typeof p === 'string' && p) : [],
-                    goodSigs: Array.isArray(cfg.goodSigs) ? cfg.goodSigs.filter(p => typeof p === 'string' && p) : []
+                    goodSigs: Array.isArray(cfg.goodSigs) ? cfg.goodSigs.filter(p => typeof p === 'string' && p) : [],
+                    // Pager exceptions: same shape as the thread ones, applied to the
+                    // taught next-link group instead.
+                    nextExclude: Array.isArray(cfg.nextExclude) ? cfg.nextExclude.filter(p => typeof p === 'string' && p) : [],
+                    nextExcludeSigs: Array.isArray(cfg.nextExcludeSigs) ? cfg.nextExcludeSigs.filter(p => typeof p === 'string' && p) : [],
+                    nextGoodSigs: Array.isArray(cfg.nextGoodSigs) ? cfg.nextGoodSigs.filter(p => typeof p === 'string' && p) : []
                 };
             }
             return out;
@@ -416,6 +421,30 @@
         return byNum.get(current + 1) || null;
     }
 
+    // Un-taught bootstrap: which same-position group of numeric links is actually a
+    // pager? Per-post metadata counts ("💬 8", "3 replies") are numeric links too, so
+    // a bare "smallest unlinked number" scan over the whole page picks nonsense.
+    // A real page list starts at 1 or 2 and runs consecutively.
+    function pickPagerGroup(anchors) {
+        const groups = new Map();
+        for (const r of anchors) {
+            if (!/^\d{1,6}$/.test(r.text)) continue;
+            const sig = signature(r.a, true);
+            if (!groups.has(sig)) groups.set(sig, []);
+            groups.get(sig).push(r);
+        }
+        let best = null;
+        for (const items of groups.values()) {
+            const nums = Array.from(new Set(items.map(r => parseInt(r.text, 10)))).sort((a, b) => a - b);
+            if (nums.length < 2 || nums[0] > 2) continue;
+            let run = 1;
+            while (run < nums.length && nums[run] === nums[run - 1] + 1) run++;
+            if (run < 2) continue;
+            if (!best || run > best.run) best = { items, run };
+        }
+        return best ? best.items : [];
+    }
+
     function pickTextNext(anchors) {
         for (const r of anchors) {
             const al = (r.a.getAttribute('aria-label') || '').trim();
@@ -432,10 +461,16 @@
         base = base || location.href;
         const anchors = allAnchors(root, base);
 
+        // A taught pager is authoritative: no falling back to the heuristics below.
+        // Falling through is what let a per-post comment-count link ("💬 8" — a bare
+        // number, so it looks like a page link) become the next page. An empty group
+        // means "last page", which must yield null, not a guess.
         if (cfg && cfg.nextSig) {
-            const grp = anchors.filter(r => signature(r.a, true) === cfg.nextSig);
+            const exRx = compileExcludes(cfg.nextExclude);
+            const grp = anchors.filter(r => signature(r.a, true) === cfg.nextSig &&
+                !excludedBySig(r.a, cfg.nextExcludeSigs) && !excludedByRx(r.urlObj, exRx));
             const r = pickNumericNext(grp) || pickTextNext(grp) || (grp.length === 1 ? grp[0] : null);
-            if (r) return { url: r.url, a: r.a, how: 'taught pager link' };
+            return r ? { url: r.url, a: r.a, how: 'taught pager link' } : null;
         }
 
         let origin;
@@ -453,7 +488,7 @@
             }
         }
 
-        const num = pickNumericNext(anchors);
+        const num = pickNumericNext(pickPagerGroup(anchors));
         if (num) return { url: num.url, a: num.a, how: 'numeric page link' };
         const txt = pickTextNext(anchors);
         if (txt) return { url: txt.url, a: txt.a, how: 'next/older text link' };
@@ -551,26 +586,55 @@
     }
 
     // ---------------- Teaching: guided click-to-pick ----------------
-    // Two guided flows, each a centered draggable popup with click capture:
-    //  - Teach threads ('full'): wipes the site's taught rules, asks for the first
-    //    thread link, highlights every match in green for verification, then saves.
-    //    The next-page link is auto-detected and only asked for when that fails.
-    //    Esc/Cancel exits with the rules left wiped.
-    //  - Exceptions ('except'): runs on any page, no wipe. Highlights what the saved
-    //    rule catches there; each click on a wrong link becomes a structural
-    //    (position) rule when the markup discriminates against the stored good
-    //    chains, else a URL-shape rule (grouped/merged as before). Save APPENDS the
-    //    new rules to the stored ones — earlier exceptions (possibly taught on other
-    //    pages) survive. Esc/Cancel changes nothing.
-    let teach = null;        // { domain, mode: 'full'|'except', step: 'topic'|'verify'|'except'|'next', sig, pattern, goodSigs, baseExcludes, baseExcludeSigs, excludeGroups, excludeSigs }
+    // Guided flows, each a centered draggable popup with click capture:
+    //  - Teach threads ('full'): wipes the site's taught rules, then walks the whole
+    //    setup in one pass — pick the first thread link → verify the highlighted
+    //    matches (with an inline "Fix wrong links" detour) → confirm or click the
+    //    next-page link → verify the pager and exclude anything in it that isn't a
+    //    page number. Esc/Cancel exits with the rules left wiped.
+    //  - Exceptions ('except'): runs on any page, no wipe, thread links only.
+    //    Highlights what the saved rule catches there; each click on a wrong link
+    //    becomes a structural (position) rule when the markup discriminates against
+    //    the stored good chains, else a URL-shape rule. Save APPENDS to the stored
+    //    rules. Esc/Cancel changes nothing.
+    //  - Next link ('nextonly'): the pager half of the full flow on its own, for
+    //    checking/correcting "next page" from the bar's debug drawer.
+    //
+    // Thread links and the pager are taught with the SAME machinery, so `teach` holds
+    // one rule store per target and `R()` points at whichever is being edited.
+    const mkRule = () => ({
+        sig: null, pattern: null, goodSigs: [],
+        baseExcludes: [], baseExcludeSigs: [], excludeGroups: [], excludeSigs: []
+    });
+    let teach = null;        // { domain, mode, silent, step, target: 'topics'|'next', topics: rule, next: rule }
     let teachPopup = null;
-    let hl = [];             // highlighted anchors, with their original outline to restore
+    let hl = [];             // highlighted anchors, with their original styles to restore
     let hoverEl = null;
 
-    function computeExcludePatterns() {
-        return teach.excludeGroups
+    const R = () => teach[teach.target];
+
+    function computeExcludePatterns(rule) {
+        return (rule || R()).excludeGroups
             .map(g => g.length >= 2 ? deriveFromUrls(g) : digitGen(g[0]))
             .filter(p => typeof p === 'string' && p);
+    }
+
+    // The pager candidates on this page: every anchor sharing the taught next-link
+    // position. Deliberately NOT filtered like topic links — page numbers are bare
+    // digits, which collectAnchors drops.
+    function pagerRecords(sig) {
+        if (!sig) return [];
+        return allAnchors(document, location.href).filter(r => signature(r.a, true) === sig);
+    }
+
+    // The pager rule as detectNextRecord wants it, including edits not yet saved.
+    function liveNextCfg() {
+        const r = teach.next;
+        return {
+            nextSig: r.sig,
+            nextExclude: r.baseExcludes.concat(computeExcludePatterns(r)),
+            nextExcludeSigs: r.baseExcludeSigs.concat(r.excludeSigs)
+        };
     }
     // Anchors on the live page matched by a rule ({ sig, pattern } — a stored site cfg
     // or the in-progress teach state): structure UNIONED with the URL pattern, exactly
@@ -610,24 +674,52 @@
         return { inc, exc };
     }
 
-    const matchedRecords = () => ruleRecords(teach);
+    const matchedRecords = () =>
+        (teach.target === 'next') ? pagerRecords(R().sig) : ruleRecords(R());
     function includedRecords() {
+        const r = R();
         return splitByExceptions(matchedRecords(),
-            teach.baseExcludes.concat(computeExcludePatterns()),
-            teach.baseExcludeSigs.concat(teach.excludeSigs)).inc;
+            r.baseExcludes.concat(computeExcludePatterns(r)),
+            r.baseExcludeSigs.concat(r.excludeSigs)).inc;
     }
 
-    function clearHighlights() {
-        for (const h of hl) { h.el.style.outline = h.outline; h.el.style.outlineOffset = h.offset; }
-        hl = [];
-    }
-    function applyHighlights(records) {
-        clearHighlights();
-        for (const r of records) {
-            hl.push({ el: r.a, outline: r.a.style.outline, offset: r.a.style.outlineOffset });
-            r.a.style.outline = '3px solid #a6e3a1';
-            r.a.style.outlineOffset = '1px';
+    // ---------------- Highlight painting ----------------
+    // `outline` alone is unreliable across forums: an anchor whose own box is
+    // degenerate (icon links, links whose children are floated or absolutely
+    // positioned, links that wrap block content) renders as a stray line beside the
+    // text instead of a box. Two mitigations: paint the nearest ancestor that
+    // actually has a box, and tint the background as well, which shows up even when
+    // the outline is drawn oddly.
+    const HL_PROPS = ['outline', 'outlineOffset', 'backgroundColor', 'borderRadius'];
+    function paintTarget(a) {
+        let el = a;
+        for (let i = 0; i < 3 && el && el.getBoundingClientRect; i++) {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 8 && r.height >= 8) return el;
+            el = el.parentElement;
         }
+        return a;
+    }
+    function paintHl(store, a, color) {
+        if (!a) return;
+        const el = paintTarget(a);
+        const saved = { el };
+        for (const p of HL_PROPS) saved[p] = el.style[p];
+        store.push(saved);
+        el.style.outline = '3px solid ' + color;
+        el.style.outlineOffset = '1px';
+        el.style.backgroundColor = color + '40';   // #rrggbb + alpha
+        el.style.borderRadius = '3px';
+    }
+    function unpaintHl(store) {
+        for (const h of store) for (const p of HL_PROPS) h.el.style[p] = h[p];
+        store.length = 0;
+    }
+
+    function clearHighlights() { unpaintHl(hl); }
+    function applyHighlights(records, color) {
+        clearHighlights();
+        for (const r of records) paintHl(hl, r.a, color || '#a6e3a1');
     }
 
     function popBtn(label, bg, fg) {
@@ -676,7 +768,9 @@
             e.preventDefault();
         });
         const msg = document.createElement('div');
-        msg.style.cssText = 'font-weight: 600;';
+        // pre-wrap: the pager steps show a URL on its own line (textContent only —
+        // never innerHTML, which Trusted Types sites reject).
+        msg.style.cssText = 'font-weight: 600; white-space: pre-wrap; word-break: break-word;';
         const extra = document.createElement('div');
         extra.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
         const btns = document.createElement('div');
@@ -737,10 +831,21 @@
         try { document.body.style.cursor = 'crosshair'; } catch (_) {}
     }
 
+    // Load the stored pager rule into a teach rule store (so an edit starts from what
+    // the site already knows and Save can append rather than overwrite).
+    function loadNextRule(cfg) {
+        const r = mkRule();
+        r.sig = cfg.nextSig || null;
+        r.goodSigs = (cfg.nextGoodSigs || []).slice();
+        r.baseExcludes = (cfg.nextExclude || []).slice();
+        r.baseExcludeSigs = (cfg.nextExcludeSigs || []).slice();
+        return r;
+    }
+
     function startGuidedTeach(domain, silent) {
         teach = {
-            domain, mode: 'full', step: 'topic', silent: !!silent, sig: null, pattern: null, goodSigs: [],
-            baseExcludes: [], baseExcludeSigs: [], excludeGroups: [], excludeSigs: []
+            domain, mode: 'full', step: 'topic', silent: !!silent, target: 'topics',
+            topics: mkRule(), next: mkRule()
         };
         enterCaptureMode();
         stepTopic();
@@ -753,35 +858,38 @@
         if (s[domain]) {
             s[domain].sig = null; s[domain].pattern = null; s[domain].nextSig = null;
             s[domain].exclude = []; s[domain].excludeSigs = []; s[domain].goodSigs = [];
+            s[domain].nextExclude = []; s[domain].nextExcludeSigs = []; s[domain].nextGoodSigs = [];
             saveSites(s);
         }
         startGuidedTeach(domain, silent);
     }
 
-    // Next-page link only: the taught pager signature outranks auto-detection, so this
-    // is how a wrong "next" (the usual cause of a bogus topic appearing mid-tour) gets
-    // corrected without re-teaching the thread links.
+    // Pager only: the taught next-link position outranks auto-detection, so this is
+    // how a wrong "next" gets corrected without re-teaching the thread links. Also
+    // the way to check, from any page of a list, which link the tour will follow.
     function startNextTeach(domain) {
-        teach = {
-            domain, mode: 'nextonly', step: 'next', silent: true, sig: null, pattern: null, goodSigs: [],
-            baseExcludes: [], baseExcludeSigs: [], excludeGroups: [], excludeSigs: []
-        };
-        enterCaptureMode();
-        setPopup('Click the link that leads to page 2 of this list — the “next page” link the tour should follow.',
-            [['Cancel', '#45475a', '#cdd6f4', cancelCapture]]);
-    }
-
-    // Exceptions-only flow: edits the stored rule additively, so nothing is wiped and
-    // Cancel is a true no-op.
-    function startExceptionTeach(domain, silent) {
         const cfg = getSites()[domain] || {};
         teach = {
-            domain, mode: 'except', step: 'except', silent: !!silent,
-            sig: cfg.sig || null, pattern: cfg.pattern || null,
-            goodSigs: (cfg.goodSigs || []).slice(),
-            baseExcludes: (cfg.exclude || []).slice(),
-            baseExcludeSigs: (cfg.excludeSigs || []).slice(),
-            excludeGroups: [], excludeSigs: []
+            domain, mode: 'nextonly', step: 'next', silent: true, target: 'next',
+            topics: mkRule(), next: loadNextRule(cfg)
+        };
+        enterCaptureMode();
+        enterNextDetect();
+    }
+
+    // Exceptions-only flow: edits the stored thread rule additively, so nothing is
+    // wiped and Cancel is a true no-op.
+    function startExceptionTeach(domain, silent) {
+        const cfg = getSites()[domain] || {};
+        const t = mkRule();
+        t.sig = cfg.sig || null;
+        t.pattern = cfg.pattern || null;
+        t.goodSigs = (cfg.goodSigs || []).slice();
+        t.baseExcludes = (cfg.exclude || []).slice();
+        t.baseExcludeSigs = (cfg.excludeSigs || []).slice();
+        teach = {
+            domain, mode: 'except', step: 'except', silent: !!silent, target: 'topics',
+            topics: t, next: mkRule()
         };
         enterCaptureMode();
         enterExcept();
@@ -850,43 +958,61 @@
     }
 
     function adoptRule(sig, pattern) {
-        teach.sig = sig;
-        teach.pattern = pattern;
-        teach.excludeGroups = [];
+        const r = teach.topics;
+        r.sig = sig;
+        r.pattern = pattern;
+        r.excludeGroups = [];
+        r.excludeSigs = [];
+        // Seed the known-good chains from the structure matches right away: the
+        // inline "Fix wrong links" step needs them to build position-based rules
+        // (the wrong links are typically URL-pattern-only matches sitting in
+        // different markup, which is exactly what a position rule separates).
+        r.goodSigs = sig ? Array.from(new Set(clusterForSig(sig).map(x => sigDeep(x.a)))).slice(0, 12) : [];
+        teach.target = 'topics';
         enterVerify();
     }
 
-    function enterVerify() {
+    function enterVerify(note) {
         teach.step = 'verify';
+        teach.target = 'topics';
         const inc = includedRecords();
         applyHighlights(inc);
-        setPopup(inc.length + ' link' + (inc.length === 1 ? ' is' : 's are') + ' highlighted in green. ' +
+        setPopup((note ? note + '  ' : '') +
+            inc.length + ' link' + (inc.length === 1 ? ' is' : 's are') + ' highlighted in green. ' +
             'Scroll the page and check that ONLY thread links are highlighted. ' +
-            '(Wrong links can be excluded afterwards with the site’s Exceptions button.)',
+            'If anything else is highlighted, use “Fix wrong links” and click each one.',
             [
                 ['Looks good ✓', '#a6e3a1', null, confirmSave],
+                ['Fix wrong links…', '#f9e2af', null, () => enterExcept()],
                 ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
             ]);
     }
 
+    // Click-to-exclude. Reached inline from enterVerify (full flow — "Done" returns to
+    // the verification step) or as the standalone Exceptions flow ("Save" writes and
+    // finishes). Works on either target; the pager wording differs because page
+    // numbers, not thread titles, are what should survive.
     function enterExcept(note) {
         teach.step = 'except';
+        const inline = teach.mode !== 'except';
+        const r = R();
         const inc = includedRecords();
         applyHighlights(inc);
-        if (!inc.length && !teach.excludeGroups.length) {
-            setPopup('The taught rule doesn’t match any links on this page (or existing exceptions already remove them all). ' +
+        if (!inc.length && !r.excludeGroups.length && !r.excludeSigs.length) {
+            setPopup('The rule doesn’t match any links on this page (or existing exceptions already remove them all). ' +
                 'Open a page where the wrong links appear, then try again.',
-                [['Close', '#45475a', '#cdd6f4', cancelCapture]]);
+                [['Close', '#45475a', '#cdd6f4', inline ? (() => enterVerify()) : cancelCapture]]);
             return;
         }
         setPopup((typeof note === 'string' ? note + '  ' : '') +
             'These ' + inc.length + ' highlighted links are what the rule currently catches on this page. ' +
-            'Click any that should NOT be included — similar links are removed with it. ' +
-            'New exceptions are ADDED to the existing ones.' +
-            (teach.goodSigs.length ? '' :
-                ' (This site was taught by an older version — re-teach the threads once to enable position-based exceptions.)'),
+            'Click any that should NOT be included — similar links are removed with it.' +
+            (inline ? '' : ' New exceptions are ADDED to the existing ones.') +
+            (inline || r.goodSigs.length ? '' :
+                ' (This site was taught by an older version — re-teach it once to enable position-based exceptions.)'),
             [
-                ['Save ✓', '#a6e3a1', null, saveExceptions],
+                inline ? ['Done ✓', '#a6e3a1', null, () => enterVerify('Exceptions applied.')]
+                       : ['Save ✓', '#a6e3a1', null, saveExceptions],
                 ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
             ]);
     }
@@ -907,7 +1033,9 @@
         // A prefix that keeps some on-page links highlighted is preferred; removing
         // everything on this page is allowed only when stored good chains exist to
         // prove real thread links live elsewhere in different markup.
-        const goods = teach.goodSigs || [];
+        const rule = R();
+        const undo = { groups: rule.excludeGroups.map(g => g.slice()), sigs: rule.excludeSigs.slice() };
+        const goods = rule.goodSigs || [];
         const parts = sigDeep(a).split('>');
         let withSurvivors = null, removesAll = null;
         for (let d = 1; d <= parts.length; d++) {
@@ -919,15 +1047,15 @@
         }
         const pick = withSurvivors || removesAll;
         if (pick) {
-            if (!teach.excludeSigs.includes(pick)) teach.excludeSigs.push(pick);
+            if (!rule.excludeSigs.includes(pick)) rule.excludeSigs.push(pick);
         } else {
             // Structure doesn't discriminate (identical markup) — fall back to URL-shape
             // rules. Join an existing exception group when the merged rule stays
             // specific (still leaves some links highlighted); otherwise start a new group.
-            const rxsNow = compileExcludes(teach.baseExcludes.concat(computeExcludePatterns()));
-            const exSigsNow = teach.baseExcludeSigs.concat(teach.excludeSigs);
+            const rxsNow = compileExcludes(rule.baseExcludes.concat(computeExcludePatterns(rule)));
+            const exSigsNow = rule.baseExcludeSigs.concat(rule.excludeSigs);
             let placed = false;
-            for (const g of teach.excludeGroups) {
+            for (const g of rule.excludeGroups) {
                 const cand = deriveFromUrls(g.concat([uo]));
                 if (!cand) continue;
                 let rx;
@@ -937,68 +1065,171 @@
                     !excludedByRx(r.urlObj, rxsNow) && !rx.test(r.urlObj.pathname + r.urlObj.search));
                 if (remaining.length > 0) { g.push(uo); placed = true; break; }
             }
-            if (!placed) teach.excludeGroups.push([uo]);
+            if (!placed) rule.excludeGroups.push([uo]);
         }
 
         const inc = includedRecords();
-        enterExcept(inc.length ? 'Removed.' :
-            'Removed — nothing is highlighted on this page now. That is fine on a page with no real thread links; Cancel if it took too much.');
+        // Page numbers all share a URL shape, so a URL-shape rule derived from one of
+        // them wipes the whole pager. Never let a pager exception empty the group.
+        if (teach.target === 'next' && !inc.length) {
+            rule.excludeGroups = undo.groups;
+            rule.excludeSigs = undo.sigs;
+            enterNextVerify('Skipped — excluding that link would have removed every page link too.');
+            return;
+        }
+        const note = inc.length ? 'Removed.' :
+            'Removed — nothing is highlighted on this page now. That is fine on a page with no real thread links; Cancel if it took too much.';
+        if (teach.target === 'next') enterNextVerify(note); else enterExcept(note);
     }
 
     function confirmSave() {
         const sites = getSites();
         const cfg = sites[teach.domain];
         if (cfg) {
-            cfg.sig = teach.sig;
-            cfg.pattern = teach.pattern;
-            cfg.exclude = computeExcludePatterns();
-            cfg.excludeSigs = [];
+            const r = teach.topics;
+            cfg.sig = r.sig;
+            cfg.pattern = r.pattern;
+            cfg.exclude = computeExcludePatterns(r);
+            cfg.excludeSigs = r.excludeSigs.slice();
             // Remember the deep markup chains of the STRUCTURE matches only — the
             // known-good reference that later lets an exception rule prove it only
             // removes links in OTHER positions (even on pages with no good links).
             // Deliberately not includedRecords(): that also holds the URL-pattern
             // matches, which are exactly the links Exceptions exists to remove —
-            // marking them good would make every position rule refuse to fire.
-            const goodRecs = teach.sig ? clusterForSig(teach.sig) : includedRecords();
-            cfg.goodSigs = Array.from(new Set(goodRecs.map(r => sigDeep(r.a)))).slice(0, 12);
+            // marking them good would make every position rule refuse to fire. Links
+            // the user just excluded are dropped too, for the same reason.
+            const kept = new Set(includedRecords().map(x => x.url));
+            const goodRecs = (r.sig ? clusterForSig(r.sig) : includedRecords()).filter(x => kept.has(x.url));
+            cfg.goodSigs = Array.from(new Set(goodRecs.map(x => sigDeep(x.a)))).slice(0, 12);
             saveSites(sites);
         }
         clearHighlights();
-        const nxt = detectNextPage(document, location.href, {});
-        if (nxt) {
-            finishTeach('✓ Saved. The next-page link was found automatically — all set!');
-        } else {
-            teach.step = 'next';
-            setPopup('Saved the thread links. The “next page” link couldn’t be found automatically — ' +
-                'click the link to page 2 of this list (or Skip if there is none).',
-                [['Skip', '#45475a', '#cdd6f4', () => finishTeach('✓ Saved (no next-page link taught).')]]);
+        enterNextDetect();
+    }
+
+    // ---------------- Teaching: the pager ----------------
+    // Auto-detect the next-page link, show it, and make the user confirm it. This is
+    // the step that catches the classic failure: a per-post "💬 8" comment-count link
+    // is a bare number, so the numeric-page-link heuristic happily treats it as the
+    // pager and the tour walks off into a random thread.
+    function enterNextDetect(note) {
+        teach.target = 'next';
+        teach.step = 'confirm';
+        clearHighlights();
+        const rec = detectNextRecord(document, location.href, liveNextCfg());
+        if (!rec) {
+            stepNextPick('No “next page” link was found automatically.');
+            return;
         }
+        if (rec.a) {
+            paintHl(hl, rec.a, '#89b4fa');
+            try { rec.a.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+        }
+        setPopup((note ? note + '  ' : '') +
+            'This is the link I would follow for the next page of threads (highlighted in blue):\n' +
+            rec.url + '\n(found via ' + rec.how + ')\n\n' +
+            'Is that the link to page 2 of this list?',
+            [
+                ['Yes ✓', '#a6e3a1', null, () => adoptNext(rec)],
+                ['No — I’ll click it', '#f9e2af', null, () => stepNextPick()],
+                ['There is no page 2', '#45475a', '#cdd6f4', () => saveNext(true)]
+            ]);
+    }
+
+    function stepNextPick(note) {
+        teach.target = 'next';
+        teach.step = 'next';
+        clearHighlights();
+        setPopup((note ? note + '  ' : '') +
+            'Click the link to page 2 of this list — a numbered page link, not “Last”. ' +
+            'The tour uses the numbers to work out which page comes after the one it is on.',
+            [['There is no page 2', '#45475a', '#cdd6f4', () => saveNext(true)],
+             ['Cancel', '#45475a', '#cdd6f4', cancelCapture]]);
+    }
+
+    function pickNext(a) {
+        const rule = teach.next;
+        rule.sig = signature(a, true);
+        rule.goodSigs = [sigDeep(a)];
+        rule.excludeGroups = [];
+        rule.excludeSigs = [];
+        enterNextVerify('Learned that spot.');
+    }
+
+    // Confirming an auto-detected link still records its position, so later pages are
+    // resolved by the taught rule instead of re-running the guesswork that just
+    // happened to be right here. A <link rel=next> in the head has no anchor to
+    // learn from — accept it and keep relying on auto-detection.
+    function adoptNext(rec) {
+        if (!rec.a) { saveNext(false, 'The next-page link is declared in the page header — nothing to learn.'); return; }
+        const rule = teach.next;
+        rule.sig = signature(rec.a, true);
+        rule.goodSigs = [sigDeep(rec.a)];
+        enterNextVerify();
+    }
+
+    // Verify the pager the same way threads are verified: everything sharing the
+    // taught position is highlighted (yellow), the link that will actually be
+    // followed is blue, and clicking a highlighted link excludes it.
+    function enterNextVerify(note) {
+        teach.target = 'next';
+        teach.step = 'except';
+        const inc = includedRecords();
+        const chosen = detectNextRecord(document, location.href, liveNextCfg());
+        clearHighlights();
+        if (chosen && chosen.a) paintHl(hl, chosen.a, '#89b4fa');
+        for (const r of inc) if (!chosen || r.a !== chosen.a) paintHl(hl, r.a, '#f9e2af');
+        if (chosen && chosen.a) {
+            try { chosen.a.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {}
+        }
+        setPopup((note ? note + '  ' : '') +
+            'Blue = the link the tour will follow next:\n' + (chosen ? chosen.url : '(none — the tour would stop here)') + '\n\n' +
+            'Yellow = the ' + Math.max(0, inc.length - (chosen && chosen.a ? 1 : 0)) + ' other link(s) in that same spot. ' +
+            'Click any highlighted link that is NOT part of this list’s page numbers.',
+            [
+                ['Looks good ✓', '#a6e3a1', null, () => saveNext(false)],
+                ['Click a different link', '#f9e2af', null, () => stepNextPick()],
+                ['Cancel', '#45475a', '#cdd6f4', cancelCapture]
+            ]);
+    }
+
+    function saveNext(none, why) {
+        const rule = teach.next;
+        const sites = getSites();
+        const cfg = sites[teach.domain];
+        if (cfg) {
+            if (none) {
+                cfg.nextSig = null; cfg.nextExclude = []; cfg.nextExcludeSigs = []; cfg.nextGoodSigs = [];
+            } else if (rule.sig) {
+                cfg.nextSig = rule.sig;
+                cfg.nextExclude = rule.baseExcludes.concat(computeExcludePatterns(rule));
+                cfg.nextExcludeSigs = rule.baseExcludeSigs.concat(rule.excludeSigs);
+                cfg.nextGoodSigs = rule.goodSigs.slice(0, 4);
+            }
+            saveSites(sites);
+        }
+        finishTeach(none ? '✓ Saved — no next page on this list.'
+            : (why ? '✓ Saved. ' + why : '✓ Saved, including the next-page link.'));
     }
 
     // Exceptions flow: append the new rules to the stored ones — never overwrite.
     function saveExceptions() {
-        const addedRx = computeExcludePatterns().filter(p => !teach.baseExcludes.includes(p));
-        const addedSigs = teach.excludeSigs.filter(s => !teach.baseExcludeSigs.includes(s));
+        const r = teach.topics;
+        const addedRx = computeExcludePatterns(r).filter(p => !r.baseExcludes.includes(p));
+        const addedSigs = r.excludeSigs.filter(s => !r.baseExcludeSigs.includes(s));
         const n = addedRx.length + addedSigs.length;
         if (n) {
             const sites = getSites();
             const cfg = sites[teach.domain];
             if (cfg) {
-                cfg.exclude = teach.baseExcludes.concat(addedRx);
-                cfg.excludeSigs = teach.baseExcludeSigs.concat(addedSigs);
+                cfg.exclude = r.baseExcludes.concat(addedRx);
+                cfg.excludeSigs = r.baseExcludeSigs.concat(addedSigs);
                 saveSites(sites);
             }
         }
         finishTeach(n
             ? '✓ Added ' + n + ' exception rule' + (n === 1 ? '' : 's') + '.'
             : 'No exceptions were added — nothing changed.');
-    }
-
-    function pickNext(a) {
-        const sites = getSites();
-        const cfg = sites[teach.domain];
-        if (cfg) { cfg.nextSig = signature(a, true); saveSites(sites); }
-        finishTeach('✓ Saved, including the next-page link.');
     }
 
     function finishTeach(msgText) {
@@ -1131,17 +1362,9 @@
     let dbgHl = [];
     let drawerOpen = false;
 
-    function dbgClearHl() {
-        for (const h of dbgHl) { h.el.style.outline = h.outline; h.el.style.outlineOffset = h.offset; }
-        dbgHl = [];
-    }
+    const dbgClearHl = () => unpaintHl(dbgHl);
     function dbgMark(els, color) {
-        for (const el of els) {
-            if (!el) continue;
-            dbgHl.push({ el, outline: el.style.outline, offset: el.style.outlineOffset });
-            el.style.outline = '3px solid ' + color;
-            el.style.outlineOffset = '1px';
-        }
+        for (const el of els) paintHl(dbgHl, el, color);
     }
 
     // Re-derive the three debug sets and paint whichever toggles are on.
@@ -1163,7 +1386,16 @@
         const next = detectNextRecord(document, location.href, cfg);
         if (dbg.found) dbgMark(inc.map(r => r.a), '#a6e3a1');
         if (dbg.excl) dbgMark(exc.map(r => r.a), '#f38ba8');
-        if (dbg.next && next) dbgMark([next.a], '#89b4fa');
+        if (dbg.next && next) {
+            dbgMark([next.a], '#89b4fa');
+            // The rest of the taught pager in yellow, so it's obvious whether the blue
+            // link really is the next number in that list.
+            if (cfg.nextSig) {
+                dbgMark(pagerRecords(cfg.nextSig)
+                    .filter(r => r.a !== next.a && !excludedBySig(r.a, cfg.nextExcludeSigs))
+                    .map(r => r.a), '#f9e2af');
+            }
+        }
         return { inc, exc, next, taught };
     }
 
@@ -1284,7 +1516,7 @@
             teachBtn.addEventListener('click', () => { hideBar(); wipeAndTeach(d, true); });
             const excBtn = dbgBtn('Exceptions', 'Click wrong links to exclude them — added on top of the existing exceptions');
             excBtn.addEventListener('click', () => { hideBar(); startExceptionTeach(d, true); });
-            const nextBtn = dbgBtn('Teach next link', 'Click the real page-2 link to correct a wrong “next page”');
+            const nextBtn = dbgBtn('Check next link', 'Show the link the tour will follow from this page, and correct it if it is wrong');
             nextBtn.addEventListener('click', () => { hideBar(); startNextTeach(d); });
             const setBtn = dbgBtn('Settings…', 'Open the full Forum Stumbler settings');
             setBtn.addEventListener('click', openSettings);
@@ -1603,7 +1835,7 @@
         descMain.textContent = 'Forum Stumbler only scans the sites listed here (opt-in). By default a site is scoped to the subforum pages you add; tick "whole site" to scan everywhere on it.';
         const descTeach = document.createElement('div');
         descTeach.style.cssText = 'margin-top: 4px; color: #6c7086; font-style: italic;';
-        descTeach.textContent = 'The ⚙ button on the floating bar opens a per-site drawer that highlights what is captured, what the exceptions remove, and which link is treated as “next page” (with a way to re-teach it). Teach threads: a popup guides you — click the first thread link, then verify the green highlights (re-teaching wipes the old rules, exceptions included). Exceptions: on any page, highlights what the rule catches so you can click wrong links to exclude them — new exceptions are added to the existing ones.';
+        descTeach.textContent = 'The ⚙ button on the floating bar opens a per-site drawer that highlights what is captured, what the exceptions remove, and which link is treated as “next page” (with a way to re-teach it). Teach threads: a popup guides you through the whole setup — click the first thread link, verify the green highlights (clicking wrong ones to exclude them), then confirm or click the “next page” link and check the pager (re-teaching wipes the old rules, exceptions included). Exceptions: on any page, highlights what the rule catches so you can click wrong links to exclude them — new exceptions are added to the existing ones.';
         desc.appendChild(descMain);
         desc.appendChild(descTeach);
 
@@ -1683,6 +1915,8 @@
                     badge.title = 'Structure: ' + (cfg.sig || '(none)') +
                         (cfg.pattern ? '\nURL pattern: ' + cfg.pattern : '') +
                         (cfg.nextSig ? '\nNext-page: ' + cfg.nextSig : '') +
+                        (cfg.nextExclude.length ? '\nPager URL exceptions:\n' + cfg.nextExclude.join('\n') : '') +
+                        (cfg.nextExcludeSigs.length ? '\nPager position exceptions:\n' + cfg.nextExcludeSigs.join('\n') : '') +
                         (cfg.exclude.length ? '\nURL exceptions:\n' + cfg.exclude.join('\n') : '') +
                         (cfg.excludeSigs.length ? '\nPosition exceptions:\n' + cfg.excludeSigs.join('\n') : '');
                     row.appendChild(badge);
@@ -1829,7 +2063,11 @@
                 const pf = suggestPrefix(location.href);
                 if (pf) prefixes.push(pf);
             }
-            sites[d] = { all: false, prefixes, pattern: null, sig: null, nextSig: null, exclude: [], excludeSigs: [], goodSigs: [] };
+            sites[d] = {
+                all: false, prefixes, pattern: null, sig: null, nextSig: null,
+                exclude: [], excludeSigs: [], goodSigs: [],
+                nextExclude: [], nextExcludeSigs: [], nextGoodSigs: []
+            };
             saveSites(sites);
             renderList();
             input.value = '';
@@ -1898,7 +2136,10 @@
                             nextSig: (cfg && typeof cfg.nextSig === 'string') ? cfg.nextSig : null,
                             exclude: (cfg && Array.isArray(cfg.exclude)) ? cfg.exclude.filter(p => typeof p === 'string' && p) : [],
                             excludeSigs: (cfg && Array.isArray(cfg.excludeSigs)) ? cfg.excludeSigs.filter(p => typeof p === 'string' && p) : [],
-                            goodSigs: (cfg && Array.isArray(cfg.goodSigs)) ? cfg.goodSigs.filter(p => typeof p === 'string' && p) : []
+                            goodSigs: (cfg && Array.isArray(cfg.goodSigs)) ? cfg.goodSigs.filter(p => typeof p === 'string' && p) : [],
+                            nextExclude: (cfg && Array.isArray(cfg.nextExclude)) ? cfg.nextExclude.filter(p => typeof p === 'string' && p) : [],
+                            nextExcludeSigs: (cfg && Array.isArray(cfg.nextExcludeSigs)) ? cfg.nextExcludeSigs.filter(p => typeof p === 'string' && p) : [],
+                            nextGoodSigs: (cfg && Array.isArray(cfg.nextGoodSigs)) ? cfg.nextGoodSigs.filter(p => typeof p === 'string' && p) : []
                         };
                         n++;
                     }
